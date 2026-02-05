@@ -2954,7 +2954,7 @@ async function cmdCalendarFree(options: CliOptions) {
   await disconnect(conn);
 }
 
-async function main() {
+export async function main() {
   const args = process.argv.slice(2);
 
   // Handle --version / -v early before parsing

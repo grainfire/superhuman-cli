@@ -25,6 +25,9 @@ if (isMcpMode) {
 } else {
   // CLI mode - import and run the CLI
   import("./cli").then((cli) => {
-    // cli.ts handles everything via its main() function
+    cli.main().catch((e: Error) => {
+      console.error(`Fatal error: ${e.message}`);
+      process.exit(1);
+    });
   });
 }
