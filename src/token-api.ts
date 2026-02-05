@@ -390,7 +390,8 @@ export async function msgraphFetch(
   }
 
   if (!response.ok) {
-    throw new Error(`MS Graph API error: ${response.status} ${response.statusText}`);
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(`MS Graph API error: ${response.status} ${response.statusText}: ${errorBody}`);
   }
 
   return response.json();
@@ -1632,7 +1633,7 @@ function toMsGraphDateTime(
   isEndTime: boolean = false
 ): { dateTime: string | undefined; timeZone: string } {
   const dateTime = input.dateTime ||
-    (input.date ? `${input.date}T${isEndTime ? "23:59:59" : "00:00:00"}` : undefined);
+    (input.date ? `${input.date}T00:00:00` : undefined);
   return {
     dateTime,
     timeZone: input.timeZone || "UTC",

@@ -63,6 +63,7 @@ import {
   hasCachedSuperhumanCredentials,
   getThreadInfoDirect,
   sendEmailDirect,
+  createCalendarEventDirect,
 } from "./token-api";
 
 const VERSION = "0.8.0";
@@ -194,6 +195,8 @@ ${colors.bold}OPTIONS${colors.reset}
   --include-done     Search all emails including archived/done (uses Gmail API directly)
   --json             Output as JSON (for inbox/search/read)
   --date <date>      Date for calendar (YYYY-MM-DD or "today", "tomorrow")
+  --end-date <date>  End date for multi-day all-day events (YYYY-MM-DD)
+  --location <text>  Event location (for calendar-create/update)
   --calendar <name>  Calendar name or ID (default: primary)
   --range <days>     Days to show for calendar (default: 1)
   --start <time>     Event start time (ISO datetime or natural: "2pm", "tomorrow 3pm")
@@ -397,6 +400,8 @@ interface CliOptions {
   eventEnd: string; // event end time
   eventDuration: number; // event duration in minutes
   eventTitle: string; // event title
+  eventEndDate: string; // end date for multi-day all-day events (YYYY-MM-DD)
+  eventLocation: string; // event location
   eventId: string; // event ID for update/delete
   // contacts options
   contactsSubcommand: string; // subcommand for contacts (search)
@@ -446,6 +451,8 @@ function parseArgs(args: string[]): CliOptions {
     eventEnd: "",
     eventDuration: 30,
     eventTitle: "",
+    eventEndDate: "",
+    eventLocation: "",
     eventId: "",
     contactsSubcommand: "",
     contactsQuery: "",
@@ -586,6 +593,14 @@ function parseArgs(args: string[]): CliOptions {
           break;
         case "title":
           options.eventTitle = unescapeString(value);
+          i += inc;
+          break;
+        case "end-date":
+          options.eventEndDate = unescapeString(value);
+          i += inc;
+          break;
+        case "location":
+          options.eventLocation = unescapeString(value);
           i += inc;
           break;
         case "event":
@@ -2631,29 +2646,24 @@ async function cmdCalendarCreate(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
-
   const title = options.eventTitle || options.subject;
   let startTime: Date;
   let endTime: Date;
-
-  // Resolve calendar ID if provided
-  const calendarId = await resolveCalendarId(conn, options.calendarArg);
 
   // Determine if this is an all-day event
   const isAllDay = options.calendarDate && !options.eventStart;
 
   if (isAllDay) {
     startTime = parseCalendarDate(options.calendarDate);
-    endTime = new Date(startTime);
-    endTime.setDate(endTime.getDate() + 1);
+    if (options.eventEndDate) {
+      endTime = parseCalendarDate(options.eventEndDate);
+    } else {
+      endTime = new Date(startTime);
+      endTime.setDate(endTime.getDate() + 1);
+    }
   } else {
     if (!options.eventStart) {
       error("Event start time is required (--start) or use --date for all-day event");
-      await disconnect(conn);
       process.exit(1);
     }
 
@@ -2666,7 +2676,7 @@ async function cmdCalendarCreate(options: CliOptions) {
     }
   }
 
-  const eventInput: CreateEventInput = {
+  const buildEventInput = (calendarId?: string): CreateEventInput => ({
     calendarId: calendarId || undefined,
     summary: title,
     description: options.body || undefined,
@@ -2676,7 +2686,47 @@ async function cmdCalendarCreate(options: CliOptions) {
     end: isAllDay
       ? { date: endTime.toISOString().split("T")[0] }
       : { dateTime: endTime.toISOString() },
-  };
+    location: options.eventLocation || undefined,
+  });
+
+  // Fast path: use cached credentials if --account is specified
+  if (options.account) {
+    await loadTokensFromDisk();
+    const token = getCachedToken(options.account);
+    if (token) {
+      info(`Creating event via cached credentials for ${options.account}...`);
+      try {
+        const eventInput = buildEventInput(options.calendarArg || undefined);
+        // Add attendees from --to option (raw emails, no CDP resolution)
+        if (options.to.length > 0) {
+          eventInput.attendees = options.to.map(email => ({ email }));
+        }
+        const result = await createCalendarEventDirect(token, eventInput);
+        if (result) {
+          success(`Event created: ${result.eventId}`);
+          if (options.json) {
+            console.log(JSON.stringify(result, null, 2));
+          }
+        } else {
+          error("Failed to create event");
+        }
+      } catch (e: any) {
+        error(`Failed to create event: ${e.message}`);
+      }
+      return;
+    } else {
+      warn(`No cached credentials for ${options.account}, falling back to CDP...`);
+    }
+  }
+
+  const conn = await checkConnection(options.port);
+  if (!conn) {
+    process.exit(1);
+  }
+
+  // Resolve calendar ID if provided
+  const calendarId = await resolveCalendarId(conn, options.calendarArg);
+  const eventInput = buildEventInput(calendarId);
 
   // Add attendees from --to option (resolve names to emails)
   if (options.to.length > 0) {

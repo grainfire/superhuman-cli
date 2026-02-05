@@ -258,6 +258,7 @@ export const CalendarCreateSchema = z.object({
   description: z.string().optional().describe("Event description"),
   attendees: z.array(z.string()).optional().describe("List of attendee email addresses"),
   allDay: z.boolean().optional().describe("Whether this is an all-day event (if true, use date format YYYY-MM-DD for startTime)"),
+  location: z.string().optional().describe("Event location"),
 });
 
 /**
@@ -270,6 +271,7 @@ export const CalendarUpdateSchema = z.object({
   endTime: z.string().optional().describe("New end time as ISO datetime"),
   description: z.string().optional().describe("New event description"),
   attendees: z.array(z.string()).optional().describe("New list of attendee email addresses"),
+  location: z.string().optional().describe("New event location"),
 });
 
 /**
@@ -1442,6 +1444,7 @@ export async function calendarCreateHandler(args: z.infer<typeof CalendarCreateS
         ? { date: endTime.toISOString().split("T")[0] }
         : { dateTime: endTime.toISOString() },
       attendees: args.attendees?.map(email => ({ email })),
+      location: args.location,
     };
 
     const result = await createEvent(conn, eventInput);
@@ -1481,6 +1484,7 @@ export async function calendarUpdateHandler(args: z.infer<typeof CalendarUpdateS
     if (args.startTime) updates.start = { dateTime: new Date(args.startTime).toISOString() };
     if (args.endTime) updates.end = { dateTime: new Date(args.endTime).toISOString() };
     if (args.attendees) updates.attendees = args.attendees.map(email => ({ email }));
+    if (args.location) updates.location = args.location;
 
     const result = await updateEvent(conn, args.eventId, updates);
 
