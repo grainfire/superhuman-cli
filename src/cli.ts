@@ -5,7 +5,6 @@
  * Command-line interface for composing and sending emails via Superhuman.
  *
  * Usage:
- *   superhuman compose --to <email> --subject <subject> --body <body>
  *   superhuman send --to <email> --subject <subject> --body <body>
  *   superhuman draft --to <email> --subject <subject> --body <body>
  *   superhuman status
@@ -13,29 +12,19 @@
 
 import {
   connectToSuperhuman,
-  openCompose,
-  getDraftState,
-  setSubject,
-  addRecipient,
-  addCcRecipient,
-  setBody,
-  saveDraft,
-  sendDraft,
-  closeCompose,
   disconnect,
   textToHtml,
   unescapeString,
   type SuperhumanConnection,
 } from "./superhuman-api";
 import { listInbox, searchInbox } from "./inbox";
-import { readThread } from "./read";
 import { listAccounts, switchAccount, type Account } from "./accounts";
 import { replyToThread, replyAllToThread, forwardThread } from "./reply";
 import { archiveThread, deleteThread } from "./archive";
 import { markAsRead, markAsUnread } from "./read-status";
 import { listLabels, getThreadLabels, addLabel, removeLabel, starThread, unstarThread, listStarred } from "./labels";
-import { snoozeThread, unsnoozeThread, listSnoozed, parseSnoozeTime } from "./snooze";
-import { listAttachments, downloadAttachment, type Attachment } from "./attachments";
+import { parseSnoozeTime, snoozeThreadViaProvider, unsnoozeThreadViaProvider, listSnoozedViaProvider } from "./snooze";
+import { listAttachments, downloadAttachment } from "./attachments";
 import {
   listEvents,
   createEvent,
@@ -46,9 +35,10 @@ import {
   type CreateEventInput,
   type UpdateEventInput,
 } from "./calendar";
-import { sendEmail, createDraft, updateDraft, sendDraftById, deleteDraft } from "./send-api";
-import { createDraftDirect, createDraftWithUserInfo, getUserInfoFromCache, sendDraftSuperhuman, type Recipient } from "./draft-api";
+import { sendEmailViaProvider, createDraftViaProvider, updateDraftViaProvider, sendDraftByIdViaProvider, deleteDraftViaProvider } from "./send-api";
+import { createDraftWithUserInfo, getUserInfo, getUserInfoFromCache, sendDraftSuperhuman, type Recipient, type UserInfo } from "./draft-api";
 import { searchContacts, resolveRecipient, type Contact } from "./contacts";
+import { listSnippets, findSnippet, applyVars, parseVars } from "./snippets";
 import {
   getToken,
   saveTokensToDisk,
@@ -56,7 +46,6 @@ import {
   hasValidCachedTokens,
   getTokensFilePath,
   extractSuperhumanToken,
-  extractUserPrefix,
   askAI,
   getCachedToken,
   getCachedAccounts,
@@ -64,9 +53,12 @@ import {
   getThreadInfoDirect,
   sendEmailDirect,
   createCalendarEventDirect,
+  getThreadMessages,
 } from "./token-api";
+import type { ConnectionProvider } from "./connection-provider";
+import { CachedTokenProvider, CDPConnectionProvider, resolveProvider } from "./connection-provider";
 
-const VERSION = "0.8.0";
+const VERSION = "0.11.0";
 const CDP_PORT = 9333;
 
 // ANSI colors
@@ -129,48 +121,33 @@ function printHelp() {
 ${colors.bold}Superhuman CLI${colors.reset} v${VERSION}
 
 ${colors.bold}USAGE${colors.reset}
-  superhuman <command> [options]
+  superhuman <command> [subcommand] [options]
 
 ${colors.bold}COMMANDS${colors.reset}
-  ${colors.cyan}auth${colors.reset}       Extract and save tokens for offline use
-  ${colors.cyan}accounts${colors.reset}   List all linked accounts
-  ${colors.cyan}account${colors.reset}    Switch to a different account
-  ${colors.cyan}inbox${colors.reset}      List recent emails from inbox
-  ${colors.cyan}search${colors.reset}     Search emails
-  ${colors.cyan}read${colors.reset}       Read a specific email thread
-  ${colors.cyan}reply${colors.reset}      Reply to an email thread
-  ${colors.cyan}reply-all${colors.reset}  Reply-all to an email thread
-  ${colors.cyan}forward${colors.reset}    Forward an email thread
-  ${colors.cyan}archive${colors.reset}    Archive email thread(s)
-  ${colors.cyan}delete${colors.reset}     Delete (trash) email thread(s)
-  ${colors.cyan}mark-read${colors.reset}  Mark thread(s) as read
-  ${colors.cyan}mark-unread${colors.reset} Mark thread(s) as unread
-  ${colors.cyan}labels${colors.reset}     List all available labels
-  ${colors.cyan}get-labels${colors.reset} Get labels on a specific thread
-  ${colors.cyan}add-label${colors.reset}  Add a label to thread(s)
-  ${colors.cyan}remove-label${colors.reset} Remove a label from thread(s)
-  ${colors.cyan}star${colors.reset}       Star thread(s)
-  ${colors.cyan}unstar${colors.reset}     Unstar thread(s)
-  ${colors.cyan}starred${colors.reset}    List all starred threads
-  ${colors.cyan}snooze${colors.reset}     Snooze thread(s) until a specific time
-  ${colors.cyan}unsnooze${colors.reset}   Unsnooze (cancel snooze) thread(s)
-  ${colors.cyan}snoozed${colors.reset}    List all snoozed threads
-  ${colors.cyan}attachments${colors.reset} List attachments for a thread
-  ${colors.cyan}download${colors.reset}   Download attachments from a thread
-  ${colors.cyan}calendar${colors.reset}   List calendar events
-  ${colors.cyan}calendar-create${colors.reset} Create a calendar event
-  ${colors.cyan}calendar-update${colors.reset} Update a calendar event
-  ${colors.cyan}calendar-delete${colors.reset} Delete a calendar event
-  ${colors.cyan}calendar-free${colors.reset} Check free/busy availability
-  ${colors.cyan}contacts${colors.reset}   Search contacts by name
-  ${colors.cyan}ai${colors.reset}         Ask AI about an email thread (summarize, action items, etc.)
-  ${colors.cyan}compose${colors.reset}    Open compose window and fill in email (keeps window open)
-  ${colors.cyan}draft${colors.reset}      Create or update a draft
-  ${colors.cyan}delete-draft${colors.reset} Delete draft(s) by ID
-  ${colors.cyan}send-draft${colors.reset} Send a Superhuman draft with specified content
-  ${colors.cyan}send${colors.reset}       Compose and send an email, or send an existing draft
-  ${colors.cyan}status${colors.reset}     Check Superhuman connection status
-  ${colors.cyan}help${colors.reset}       Show this help message
+  ${colors.cyan}inbox${colors.reset}              List recent emails from inbox
+  ${colors.cyan}search${colors.reset} <query>      Search emails
+  ${colors.cyan}read${colors.reset} <id>           Read a specific email thread (requires --account)
+  ${colors.cyan}reply${colors.reset} <id>          Reply to an email thread
+  ${colors.cyan}reply-all${colors.reset} <id>      Reply-all to an email thread
+  ${colors.cyan}forward${colors.reset} <id>        Forward an email thread
+  ${colors.cyan}archive${colors.reset} <id>        Archive email thread(s)
+  ${colors.cyan}delete${colors.reset} <id>         Delete (trash) email thread(s)
+  ${colors.cyan}send${colors.reset}                Compose and send, or send an existing draft
+  ${colors.cyan}ai${colors.reset} <id> <query>     Ask AI about an email thread
+  ${colors.cyan}status${colors.reset}              Check Superhuman connection status
+  ${colors.cyan}help${colors.reset}                Show this help message
+
+${colors.bold}SUBCOMMAND GROUPS${colors.reset}
+  ${colors.cyan}account${colors.reset}  list | switch <email|index> | auth
+  ${colors.cyan}calendar${colors.reset} list | create | update | delete | free
+  ${colors.cyan}draft${colors.reset}    create | update <id> | delete <id> | send <id>
+  ${colors.cyan}label${colors.reset}    list | get <id> | add <id> | remove <id>
+  ${colors.cyan}mark${colors.reset}     read <id> | unread <id>
+  ${colors.cyan}star${colors.reset}     add <id> | remove <id> | list
+  ${colors.cyan}snooze${colors.reset}   set <id> --until <time> | cancel <id> | list
+  ${colors.cyan}attachment${colors.reset} list <id> | download <id>
+  ${colors.cyan}snippet${colors.reset}  list | use <name>
+  ${colors.cyan}contact${colors.reset}  search <query>
 
 ${colors.bold}OPTIONS${colors.reset}
   ${colors.cyan}--account <email>${colors.reset}  Account to operate on (default: current)
@@ -181,19 +158,20 @@ ${colors.bold}OPTIONS${colors.reset}
   --body <text>      Email body (plain text, converted to HTML)
   --html <text>      Email body as HTML
   --send             Send immediately instead of saving as draft (for reply/reply-all/forward)
-  --update <id>      Draft ID to update (for draft command)
+  --vars <pairs>     Template variable substitution: "key1=val1,key2=val2" (for snippet use)
   --provider <type>  Draft API: "superhuman" (default), "gmail", or "outlook"
   --draft <id>       Draft ID to send (for send command)
-  --thread <id>      Thread ID for reply/forward drafts (for send-draft command)
-  --delay <seconds>  Delay before sending in seconds (for send-draft, default: 20)
-  --label <id>       Label ID to add or remove (for add-label/remove-label)
-  --until <time>     Snooze until time: preset (tomorrow, next-week, weekend, evening) or ISO datetime
-  --output <path>    Output directory or file path (for download)
-  --attachment <id>  Specific attachment ID (for download)
+  --thread <id>      Thread ID for reply/forward drafts (for draft send)
+  --delay <seconds>  Delay before sending in seconds (for draft send, default: 20)
+  --label <id>       Label ID (for label add/remove)
+  --until <time>     Snooze until: preset (tomorrow, next-week, weekend, evening) or ISO datetime
+  --output <path>    Output directory or file path (for attachment download)
+  --attachment <id>  Specific attachment ID (for attachment download)
   --message <id>     Message ID (required with --attachment)
   --limit <number>   Number of results (default: 10, for inbox/search)
   --include-done     Search all emails including archived/done (uses Gmail API directly)
-  --json             Output as JSON (for inbox/search/read)
+  --context <number> Number of messages to show full body (default: all, for read)
+  --json             Output as JSON
   --date <date>      Date for calendar (YYYY-MM-DD or "today", "tomorrow")
   --end-date <date>  End date for multi-day all-day events (YYYY-MM-DD)
   --location <text>  Event location (for calendar-create/update)
@@ -202,21 +180,17 @@ ${colors.bold}OPTIONS${colors.reset}
   --start <time>     Event start time (ISO datetime or natural: "2pm", "tomorrow 3pm")
   --end <time>       Event end time (ISO datetime, optional if --duration)
   --duration <mins>  Event duration in minutes (default: 30)
-  --title <text>     Event title (for calendar-create/update)
-  --event <id>       Event ID (for calendar-update/delete)
+  --title <text>     Event title (for calendar create/update)
+  --event <id>       Event ID (for calendar update/delete)
   --port <number>    CDP port (default: ${CDP_PORT})
 
 ${colors.bold}EXAMPLES${colors.reset}
-  ${colors.dim}# Extract tokens for offline use${colors.reset}
-  superhuman auth
-
-  ${colors.dim}# List linked accounts${colors.reset}
-  superhuman accounts
-  superhuman accounts --json
-
-  ${colors.dim}# Switch account${colors.reset}
-  superhuman account 2
-  superhuman account user@example.com
+  ${colors.dim}# Account management${colors.reset}
+  superhuman account auth
+  superhuman account list
+  superhuman account list --json
+  superhuman account switch 2
+  superhuman account switch user@example.com
 
   ${colors.dim}# List recent emails${colors.reset}
   superhuman inbox
@@ -225,121 +199,92 @@ ${colors.bold}EXAMPLES${colors.reset}
   ${colors.dim}# Search emails${colors.reset}
   superhuman search "from:john subject:meeting"
   superhuman search "project update" --limit 20
-  superhuman search "from:anthropic" --include-done  # Search all emails including archived
+  superhuman search "from:anthropic" --include-done
 
   ${colors.dim}# Read an email thread${colors.reset}
-  superhuman read <thread-id>
-  superhuman read <thread-id> --json
+  superhuman read <thread-id> --account user@example.com
+  superhuman read <thread-id> --account user@example.com --context 3
+  superhuman read <thread-id> --account user@example.com --json
 
   ${colors.dim}# Reply to an email${colors.reset}
   superhuman reply <thread-id> --body "Thanks for the update!"
   superhuman reply <thread-id> --body "Got it!" --send
 
-  ${colors.dim}# Reply-all to an email${colors.reset}
+  ${colors.dim}# Reply-all / Forward${colors.reset}
   superhuman reply-all <thread-id> --body "Thanks everyone!"
+  superhuman forward <thread-id> --to colleague@example.com --body "FYI" --send
 
-  ${colors.dim}# Forward an email${colors.reset}
-  superhuman forward <thread-id> --to colleague@example.com --body "FYI"
-  superhuman forward <thread-id> --to colleague@example.com --send
-
-  ${colors.dim}# Archive emails${colors.reset}
+  ${colors.dim}# Archive / Delete${colors.reset}
   superhuman archive <thread-id>
-  superhuman archive <thread-id1> <thread-id2> <thread-id3>
-
-  ${colors.dim}# Delete (trash) emails${colors.reset}
-  superhuman delete <thread-id>
-  superhuman delete <thread-id1> <thread-id2> <thread-id3>
+  superhuman delete <thread-id1> <thread-id2>
 
   ${colors.dim}# Mark as read/unread${colors.reset}
-  superhuman mark-read <thread-id>
-  superhuman mark-unread <thread-id1> <thread-id2>
+  superhuman mark read <thread-id>
+  superhuman mark unread <thread-id1> <thread-id2>
 
-  ${colors.dim}# List all labels${colors.reset}
-  superhuman labels
-  superhuman labels --json
+  ${colors.dim}# Labels${colors.reset}
+  superhuman label list
+  superhuman label list --json
+  superhuman label get <thread-id>
+  superhuman label add <thread-id> --label Label_123
+  superhuman label remove <thread-id> --label Label_123
 
-  ${colors.dim}# Get labels on a thread${colors.reset}
-  superhuman get-labels <thread-id>
-  superhuman get-labels <thread-id> --json
+  ${colors.dim}# Star / Unstar${colors.reset}
+  superhuman star add <thread-id>
+  superhuman star add <thread-id1> <thread-id2>
+  superhuman star remove <thread-id>
+  superhuman star list
+  superhuman star list --json
 
-  ${colors.dim}# Add/remove labels${colors.reset}
-  superhuman add-label <thread-id> --label Label_123
-  superhuman remove-label <thread-id> --label Label_123
+  ${colors.dim}# Snooze / Unsnooze${colors.reset}
+  superhuman snooze set <thread-id> --until tomorrow
+  superhuman snooze set <thread-id> --until "2024-02-15T14:00:00Z"
+  superhuman snooze cancel <thread-id>
+  superhuman snooze list
+  superhuman snooze list --json
 
-  ${colors.dim}# Star/unstar threads${colors.reset}
-  superhuman star <thread-id>
-  superhuman star <thread-id1> <thread-id2>
-  superhuman unstar <thread-id>
-  superhuman starred
-  superhuman starred --json
+  ${colors.dim}# Attachments${colors.reset}
+  superhuman attachment list <thread-id>
+  superhuman attachment list <thread-id> --json
+  superhuman attachment download <thread-id>
+  superhuman attachment download <thread-id> --output ./downloads
+  superhuman attachment download --attachment <attachment-id> --message <message-id> --output ./file.pdf
 
-  ${colors.dim}# Snooze/unsnooze threads${colors.reset}
-  superhuman snooze <thread-id> --until tomorrow
-  superhuman snooze <thread-id> --until next-week
-  superhuman snooze <thread-id> --until "2024-02-15T14:00:00Z"
-  superhuman unsnooze <thread-id>
-  superhuman snoozed
-  superhuman snoozed --json
+  ${colors.dim}# Calendar${colors.reset}
+  superhuman calendar list
+  superhuman calendar list --date tomorrow --range 7 --json
+  superhuman calendar create --title "Meeting" --start "2pm" --duration 30
+  superhuman calendar create --title "All Day" --date 2026-02-05
+  superhuman calendar update --event <event-id> --title "New Title"
+  superhuman calendar delete --event <event-id>
+  superhuman calendar free
+  superhuman calendar free --date tomorrow --range 7
 
-  ${colors.dim}# List and download attachments${colors.reset}
-  superhuman attachments <thread-id>
-  superhuman attachments <thread-id> --json
-  superhuman download <thread-id>
-  superhuman download <thread-id> --output ./downloads
-  superhuman download --attachment <attachment-id> --message <message-id> --output ./file.pdf
+  ${colors.dim}# Contacts${colors.reset}
+  superhuman contact search "john"
+  superhuman contact search "john" --limit 5 --json
 
-  ${colors.dim}# List calendar events${colors.reset}
-  superhuman calendar
-  superhuman calendar --date tomorrow
-  superhuman calendar --range 7 --json
-
-  ${colors.dim}# Create calendar event${colors.reset}
-  superhuman calendar-create --title "Meeting" --start "2pm" --duration 30
-  superhuman calendar-create --title "All Day" --date 2026-02-05
-
-  ${colors.dim}# Update/delete calendar event${colors.reset}
-  superhuman calendar-update --event <event-id> --title "New Title"
-  superhuman calendar-delete --event <event-id>
-
-  ${colors.dim}# Check availability${colors.reset}
-  superhuman calendar-free
-  superhuman calendar-free --date tomorrow --range 7
-
-  ${colors.dim}# Search contacts by name${colors.reset}
-  superhuman contacts search "john"
-  superhuman contacts search "john" --limit 5 --json
+  ${colors.dim}# Snippets${colors.reset}
+  superhuman snippet list
+  superhuman snippet list --json
+  superhuman snippet use "zoom link" --to user@example.com
+  superhuman snippet use "share recordings" --to user@example.com --vars "date=Feb 5,student_name=Jane"
+  superhuman snippet use "share recordings" --to user@example.com --vars "date=Feb 5" --send
 
   ${colors.dim}# Ask AI about an email thread${colors.reset}
   superhuman ai <thread-id> "summarize this thread"
   superhuman ai <thread-id> "what are the action items?"
-  superhuman ai <thread-id> "draft a reply"
-  superhuman ai <thread-id> "who sent the last message?"
 
-  ${colors.dim}# Create a draft (default: appears in Superhuman UI, syncs across devices)${colors.reset}
-  superhuman draft --to user@example.com --subject "Hello" --body "Hi there!"
+  ${colors.dim}# Drafts${colors.reset}
+  superhuman draft create --to user@example.com --subject "Hello" --body "Hi there!"
+  superhuman draft create --provider=gmail --to user@example.com --subject "Hello" --body "Hi there!"
+  superhuman draft update <draft-id> --body "Updated content"
+  superhuman draft update <draft-id> --subject "New Subject" --to new@example.com
+  superhuman draft delete <draft-id>
+  superhuman draft delete <draft-id1> <draft-id2>
+  superhuman draft send <draft-id> --account=user@example.com --to=recipient@example.com --subject="Subject" --body="Body"
+  superhuman draft send <draft-id> --thread=<thread-id> --account=... ${colors.dim}# For reply/forward drafts${colors.reset}
 
-  ${colors.dim}# Create draft via direct Gmail API (faster, but may not sync immediately)${colors.reset}
-  superhuman draft --provider=gmail --to user@example.com --subject "Hello" --body "Hi there!"
-
-  ${colors.dim}# Update an existing draft${colors.reset}
-  superhuman draft --update <draft-id> --body "Updated content"
-  superhuman draft --update <draft-id> --subject "New Subject" --to new@example.com
-
-  ${colors.dim}# Delete drafts${colors.reset}
-  superhuman delete-draft <draft-id>
-  superhuman delete-draft <draft-id1> <draft-id2>
-
-  ${colors.dim}# Send a Superhuman draft (with content)${colors.reset}
-  superhuman send-draft <draft-id> --account=user@example.com --to=recipient@example.com --subject="Subject" --body="Body"
-  superhuman send-draft <draft-id> --account=user@example.com --to=recipient@example.com --subject="Subject" --body="Body" --delay=60
-  superhuman send-draft <draft-id> --thread=<original-thread-id> --account=... ${colors.dim}# For reply/forward drafts${colors.reset}
-
-  ${colors.dim}# Open compose window with pre-filled content${colors.reset}
-  superhuman compose --to user@example.com --subject "Meeting"
-
-  ${colors.dim}# Compose using contact name instead of email (auto-resolved)${colors.reset}
-  superhuman compose --to "john" --subject "Meeting"
-  superhuman draft --to "john" --cc "jane" --subject "Update"
 
   ${colors.dim}# Send an email immediately${colors.reset}
   superhuman send --to user@example.com --subject "Quick note" --body "FYI"
@@ -353,8 +298,15 @@ ${colors.bold}REQUIREMENTS${colors.reset}
 `);
 }
 
+// Commands that use noun+verb subcommand groups (e.g., "calendar create", "draft delete")
+const GROUPED_COMMANDS = new Set([
+  "calendar", "draft", "label", "star", "snooze", "mark",
+  "attachment", "snippet", "account", "contact",
+]);
+
 interface CliOptions {
   command: string;
+  subcommand: string;
   to: string[];
   cc: string[];
   bcc: string[];
@@ -404,12 +356,16 @@ interface CliOptions {
   eventLocation: string; // event location
   eventId: string; // event ID for update/delete
   // contacts options
-  contactsSubcommand: string; // subcommand for contacts (search)
   contactsQuery: string; // search query for contacts
   // search options
   includeDone: boolean; // use direct Gmail API to search all emails including archived
   // ai options
   aiQuery: string; // question to ask the AI
+  // snippet options
+  snippetQuery: string; // snippet name for fuzzy matching
+  vars: string; // template variable substitution: "key1=val1,key2=val2"
+  // read options
+  context: number; // number of messages to show full body for (0 = all)
   // draft provider option
   provider: "superhuman" | "gmail" | "outlook"; // which API to use for drafts (default: superhuman)
 }
@@ -417,6 +373,7 @@ interface CliOptions {
 function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     command: "",
+    subcommand: "",
     to: [],
     cc: [],
     bcc: [],
@@ -454,10 +411,12 @@ function parseArgs(args: string[]): CliOptions {
     eventEndDate: "",
     eventLocation: "",
     eventId: "",
-    contactsSubcommand: "",
     contactsQuery: "",
     includeDone: false,
     aiQuery: "",
+    snippetQuery: "",
+    vars: "",
+    context: 0,
     provider: "superhuman",
   };
 
@@ -575,6 +534,10 @@ function parseArgs(args: string[]): CliOptions {
           options.calendarRange = parseInt(value, 10);
           i += inc;
           break;
+        case "context":
+          options.context = parseInt(value, 10);
+          i += inc;
+          break;
         case "all-accounts":
           options.allAccounts = true;
           i++;
@@ -615,6 +578,10 @@ function parseArgs(args: string[]): CliOptions {
           options.includeDone = true;
           i += 1;
           break;
+        case "vars":
+          options.vars = unescapeString(value);
+          i += inc;
+          break;
         case "provider":
           if (value === "superhuman" || value === "gmail" || value === "outlook") {
             options.provider = value;
@@ -639,79 +606,96 @@ function parseArgs(args: string[]): CliOptions {
     } else if (!options.command) {
       options.command = arg;
       i += 1;
+    } else if (GROUPED_COMMANDS.has(options.command) && !options.subcommand) {
+      // Second positional arg for grouped commands is the subcommand
+      options.subcommand = arg;
+      i += 1;
     } else if (options.command === "search" && !options.query) {
-      // Allow search query as positional argument
       options.query = unescapeString(arg);
       i += 1;
     } else if (options.command === "read" && !options.threadId) {
-      // Allow thread ID as positional argument
       options.threadId = unescapeString(arg);
       i += 1;
     } else if (options.command === "reply" && !options.threadId) {
-      // Allow thread ID as positional argument for reply
       options.threadId = unescapeString(arg);
       i += 1;
     } else if (options.command === "reply-all" && !options.threadId) {
-      // Allow thread ID as positional argument for reply-all
       options.threadId = unescapeString(arg);
       i += 1;
     } else if (options.command === "forward" && !options.threadId) {
-      // Allow thread ID as positional argument for forward
-      options.threadId = unescapeString(arg);
-      i += 1;
-    } else if (options.command === "ai" && !options.threadId) {
-      // First positional arg for ai is thread ID
       options.threadId = unescapeString(arg);
       i += 1;
     } else if (options.command === "ai" && !options.aiQuery) {
-      // Second positional arg for ai is the question
-      options.aiQuery = unescapeString(arg);
+      // ai command: first positional arg could be a thread-id or the query.
+      // If we don't have a threadId yet, check if the arg looks like one:
+      //   - Gmail thread IDs are hex strings (e.g., 19c2fbf72ffde347)
+      //   - MS Graph conversationIds start with "AAQ"
+      // If it matches a thread-id pattern, store as threadId and expect query next.
+      // Otherwise, treat it as the query (compose mode, no thread context).
+      if (!options.threadId && (/^[0-9a-f]{10,}$/i.test(arg) || arg.startsWith("AAQ"))) {
+        options.threadId = unescapeString(arg);
+      } else {
+        options.aiQuery = unescapeString(arg);
+      }
       i += 1;
-    } else if (options.command === "account" && !options.accountArg) {
-      // Allow account index or email as positional argument
-      options.accountArg = unescapeString(arg);
-      i += 1;
-    } else if (
-      options.command === "archive" ||
-      options.command === "delete" ||
-      options.command === "mark-read" ||
-      options.command === "mark-unread" ||
-      options.command === "add-label" ||
-      options.command === "remove-label" ||
-      options.command === "star" ||
-      options.command === "unstar" ||
-      options.command === "snooze" ||
-      options.command === "unsnooze"
-    ) {
-      // Collect multiple thread IDs for bulk operations
+    } else if (options.command === "archive" || options.command === "delete") {
+      // Collect multiple thread IDs for bulk top-level operations
       options.threadIds.push(unescapeString(arg));
       i += 1;
-    } else if (options.command === "delete-draft") {
-      // Collect multiple draft IDs for delete-draft
-      options.draftIds.push(unescapeString(arg));
+    } else if (options.command === "account" && options.subcommand === "switch" && !options.accountArg) {
+      // account switch <email|index>
+      options.accountArg = unescapeString(arg);
       i += 1;
-    } else if (options.command === "get-labels" && !options.threadId) {
-      // Allow thread ID as positional argument for get-labels
+    } else if (options.command === "mark" && (options.subcommand === "read" || options.subcommand === "unread")) {
+      // mark read/unread <thread-id> [thread-id...]
+      options.threadIds.push(unescapeString(arg));
+      i += 1;
+    } else if (options.command === "label" && options.subcommand === "get" && !options.threadId) {
+      // label get <thread-id>
       options.threadId = unescapeString(arg);
       i += 1;
-    } else if (options.command === "attachments" && !options.threadId) {
-      // Allow thread ID as positional argument for attachments
+    } else if (options.command === "label" && (options.subcommand === "add" || options.subcommand === "remove")) {
+      // label add/remove <thread-id> [thread-id...]
+      options.threadIds.push(unescapeString(arg));
+      i += 1;
+    } else if (options.command === "star" && (options.subcommand === "add" || options.subcommand === "remove")) {
+      // star add/remove <thread-id> [thread-id...]
+      options.threadIds.push(unescapeString(arg));
+      i += 1;
+    } else if (options.command === "snooze" && options.subcommand === "set") {
+      // snooze set <thread-id> [thread-id...]
+      options.threadIds.push(unescapeString(arg));
+      i += 1;
+    } else if (options.command === "snooze" && options.subcommand === "cancel") {
+      // snooze cancel <thread-id> [thread-id...]
+      options.threadIds.push(unescapeString(arg));
+      i += 1;
+    } else if (options.command === "attachment" && options.subcommand === "list" && !options.threadId) {
+      // attachment list <thread-id>
       options.threadId = unescapeString(arg);
       i += 1;
-    } else if (options.command === "download" && !options.threadId && !options.attachmentId) {
-      // Allow thread ID as positional argument for download (when not using --attachment)
+    } else if (options.command === "attachment" && options.subcommand === "download" && !options.threadId && !options.attachmentId) {
+      // attachment download <thread-id>
       options.threadId = unescapeString(arg);
       i += 1;
-    } else if (options.command === "contacts" && !options.contactsSubcommand) {
-      // First positional arg after 'contacts' is the subcommand (e.g., 'search')
-      options.contactsSubcommand = arg;
-      i += 1;
-    } else if (options.command === "contacts" && options.contactsSubcommand === "search" && !options.contactsQuery) {
-      // Allow search query as positional argument for contacts search
+    } else if (options.command === "contact" && options.subcommand === "search" && !options.contactsQuery) {
+      // contact search <query>
       options.contactsQuery = unescapeString(arg);
       i += 1;
-    } else if (options.command === "send-draft" && !options.sendDraftDraftId) {
-      // Allow draft ID as positional argument for send-draft
+    } else if (options.command === "snippet" && options.subcommand === "use" && !options.snippetQuery) {
+      // snippet use <name>
+      options.snippetQuery = unescapeString(arg);
+      i += 1;
+    } else if (options.command === "draft" && options.subcommand === "update" && !options.updateDraftId) {
+      // draft update <draft-id>
+      options.updateDraftId = unescapeString(arg);
+      i += 1;
+    } else if (options.command === "draft" && options.subcommand === "delete") {
+      // draft delete <draft-id> [draft-id...]
+      options.draftIds.push(unescapeString(arg));
+      i += 1;
+    } else if (options.command === "draft" && options.subcommand === "send" && !options.sendDraftDraftId) {
+      // draft send <draft-id>
       options.sendDraftDraftId = unescapeString(arg);
       i += 1;
     } else {
@@ -740,16 +724,36 @@ async function checkConnection(port: number): Promise<SuperhumanConnection | nul
 }
 
 /**
- * Resolve all recipients in arrays (to, cc, bcc) from names to email addresses.
+ * Get a ConnectionProvider, preferring cached tokens over CDP.
+ * Exits with error message if neither is available.
+ */
+async function getProvider(options: CliOptions): Promise<ConnectionProvider> {
+  const provider = await resolveProvider({ account: options.account, port: options.port });
+  if (provider) {
+    return provider;
+  }
+  // No cached tokens — fall back to CDP
+  const conn = await checkConnection(options.port);
+  if (!conn) {
+    error("No cached tokens and could not connect to Superhuman");
+    info("Run 'superhuman account auth' to authenticate, or start Superhuman with:");
+    info(`  /Applications/Superhuman.app/Contents/MacOS/Superhuman --remote-debugging-port=${options.port}`);
+    process.exit(1);
+  }
+  return new CDPConnectionProvider(conn);
+}
+
+/**
+ * Resolve all recipients via ConnectionProvider.
  * Names without @ are looked up in contacts; emails are passed through unchanged.
  */
-async function resolveAllRecipients(
-  conn: SuperhumanConnection,
+async function resolveAllRecipientsViaProvider(
+  provider: ConnectionProvider,
   recipients: string[]
 ): Promise<string[]> {
   const resolved: string[] = [];
   for (const recipient of recipients) {
-    const email = await resolveRecipient(conn, recipient);
+    const email = await resolveRecipient(provider, recipient);
     if (email !== recipient && !recipient.includes("@")) {
       info(`Resolved "${recipient}" to ${email}`);
     }
@@ -757,6 +761,8 @@ async function resolveAllRecipients(
   }
   return resolved;
 }
+
+
 
 async function cmdStatus(options: CliOptions) {
   info(`Checking connection to Superhuman on port ${options.port}...`);
@@ -768,106 +774,199 @@ async function cmdStatus(options: CliOptions) {
 
   success("Connected to Superhuman");
 
-  // Get current state
-  const state = await getDraftState(conn);
-  if (state) {
-    log(`\n${colors.bold}Current compose state:${colors.reset}`);
-    log(`  Draft ID: ${state.id}`);
-    log(`  From: ${state.from}`);
-    log(`  To: ${state.to.join(", ") || "(none)"}`);
-    log(`  Subject: ${state.subject || "(none)"}`);
-    log(`  Dirty: ${state.isDirty}`);
-  } else {
-    log("\nNo active compose window");
-  }
-
   await disconnect(conn);
 }
 
-async function cmdCompose(options: CliOptions, keepOpen = true) {
-  if (options.to.length === 0) {
-    error("At least one recipient is required (--to)");
-    process.exit(1);
-  }
+/**
+ * Resolve UserInfo for Superhuman backend API calls.
+ * Tries cached credentials first (by --account, then any cached account), falls back to CDP.
+ */
+async function resolveBackendUserInfo(
+  options: CliOptions
+): Promise<{ userInfo: UserInfo; email: string }> {
+  await loadTokensFromDisk();
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
-
-  // Resolve names to emails
-  const resolvedTo = await resolveAllRecipients(conn, options.to);
-
-  info("Opening compose window...");
-  const draftKey = await openCompose(conn);
-  if (!draftKey) {
-    error("Failed to open compose window");
-    await disconnect(conn);
-    process.exit(1);
-  }
-  success(`Compose opened (${draftKey})`);
-
-  // Add recipients
-  for (const email of resolvedTo) {
-    info(`Adding recipient: ${email}`);
-    const added = await addRecipient(conn, email, undefined, draftKey);
-    if (added) {
-      success(`Added: ${email}`);
-    } else {
-      error(`Failed to add: ${email}`);
+  if (options.account && (await hasCachedSuperhumanCredentials(options.account))) {
+    const token = await getCachedToken(options.account);
+    if (token?.idToken && token?.userId) {
+      return {
+        userInfo: getUserInfoFromCache(token.userId, token.email, token.idToken),
+        email: token.email,
+      };
     }
   }
 
-  // Set subject
-  if (options.subject) {
-    info(`Setting subject: ${options.subject}`);
-    await setSubject(conn, options.subject, draftKey);
-    success("Subject set");
+  const accounts = getCachedAccounts();
+  for (const email of accounts) {
+    if (await hasCachedSuperhumanCredentials(email)) {
+      const token = await getCachedToken(email);
+      if (token?.idToken && token?.userId) {
+        return {
+          userInfo: getUserInfoFromCache(token.userId, token.email, token.idToken),
+          email: token.email,
+        };
+      }
+    }
   }
 
-  // Set body
-  const bodyContent = options.html || options.body;
-  if (bodyContent) {
-    info("Setting body...");
-    await setBody(conn, textToHtml(bodyContent), draftKey);
-    success("Body set");
-  }
-
-  // Get final state
-  const state = await getDraftState(conn);
-  if (state) {
-    log(`\n${colors.bold}Draft:${colors.reset}`);
-    log(`  To: ${state.to.join(", ")}`);
-    log(`  Subject: ${state.subject}`);
-    log(`  Body: ${state.body.substring(0, 100)}${state.body.length > 100 ? "..." : ""}`);
-  }
-
-  if (!keepOpen) {
-    await closeCompose(conn);
-  }
-
+  // Fall back to CDP
+  const conn = await checkConnection(options.port);
+  if (!conn) process.exit(1);
+  const userInfo = await getUserInfo(conn);
   await disconnect(conn);
-  return state;
+  return { userInfo, email: userInfo.email };
 }
+
+async function cmdSnippets(options: CliOptions) {
+  const { userInfo } = await resolveBackendUserInfo(options);
+  const snippets = await listSnippets(userInfo);
+
+  if (options.json) {
+    console.log(JSON.stringify(snippets, null, 2));
+  } else {
+    if (snippets.length === 0) {
+      info("No snippets found");
+    } else {
+      console.log(
+        `${colors.dim}${"Name".padEnd(35)} ${"Sends".padEnd(7)} ${"Last Used".padEnd(12)}${colors.reset}`
+      );
+      console.log(colors.dim + "─".repeat(56) + colors.reset);
+
+      for (const s of snippets) {
+        const name = truncate(s.name, 34);
+        const sends = String(s.sends).padEnd(7);
+        const lastUsed = s.lastSentAt ? formatDate(s.lastSentAt) : "never";
+        console.log(`${name.padEnd(35)} ${sends} ${lastUsed}`);
+      }
+
+      log(`\n${colors.dim}${snippets.length} snippet(s)${colors.reset}`);
+    }
+  }
+}
+
+async function cmdSnippet(options: CliOptions) {
+  if (!options.snippetQuery) {
+    error("Snippet name is required");
+    console.log(`Usage: superhuman snippet use <name> [--to <email>] [--vars "key=val,..."] [--send]`);
+    process.exit(1);
+  }
+
+  const { userInfo, email: accountEmail } = await resolveBackendUserInfo(options);
+
+  // Fetch snippets and fuzzy match
+  const snippets = await listSnippets(userInfo);
+  const snippet = findSnippet(snippets, options.snippetQuery);
+
+  if (!snippet) {
+    error(`No snippet matching "${options.snippetQuery}"`);
+    if (snippets.length > 0) {
+      log(`\n${colors.dim}Available snippets:${colors.reset}`);
+      for (const s of snippets) {
+        log(`  - ${s.name}`);
+      }
+    }
+    process.exit(1);
+  }
+
+  info(`Using snippet: ${snippet.name}`);
+
+  // Apply template variables
+  const vars = options.vars ? parseVars(options.vars) : {};
+  let body = snippet.body;
+  let subject = snippet.subject;
+  if (Object.keys(vars).length > 0) {
+    body = applyVars(body, vars);
+    subject = applyVars(subject, vars);
+    info(`Applied variables: ${Object.keys(vars).join(", ")}`);
+  }
+
+  // Merge recipients: CLI args override/extend snippet defaults
+  const to = options.to.length > 0 ? options.to : snippet.to;
+  const cc = options.cc.length > 0 ? options.cc : snippet.cc.length > 0 ? snippet.cc : undefined;
+  const bcc = options.bcc.length > 0 ? options.bcc : snippet.bcc.length > 0 ? snippet.bcc : undefined;
+
+  if (options.send) {
+    // Send immediately
+    if (to.length === 0) {
+      error("At least one recipient is required (--to or snippet default)");
+      process.exit(1);
+    }
+
+    const toRecipients = to.map((email: string) => ({ email }));
+    const ccRecipients = cc?.map((email: string) => ({ email }));
+    const bccRecipients = bcc?.map((email: string) => ({ email }));
+
+    // Create draft first, then send
+    const draftResult = await createDraftWithUserInfo(userInfo, {
+      to,
+      cc,
+      bcc,
+      subject,
+      body,
+    });
+
+    if (!draftResult.success || !draftResult.draftId || !draftResult.threadId) {
+      error(`Failed to create draft: ${draftResult.error}`);
+      process.exit(1);
+    }
+
+    const sendResult = await sendDraftSuperhuman(userInfo, {
+      draftId: draftResult.draftId,
+      threadId: draftResult.threadId,
+      to: toRecipients,
+      cc: ccRecipients,
+      bcc: bccRecipients,
+      subject,
+      htmlBody: body,
+      delay: 0,
+    });
+
+    if (sendResult.success) {
+      success(`Sent using snippet "${snippet.name}"`);
+      log(`  ${colors.dim}To: ${to.join(", ")}${colors.reset}`);
+      if (subject) log(`  ${colors.dim}Subject: ${subject}${colors.reset}`);
+    } else {
+      error(`Failed to send: ${sendResult.error}`);
+    }
+  } else {
+    // Create draft
+    const result = await createDraftWithUserInfo(userInfo, {
+      to,
+      cc,
+      bcc,
+      subject,
+      body,
+    });
+
+    if (result.success) {
+      success(`Draft created from snippet "${snippet.name}"`);
+      log(`  ${colors.dim}Draft ID: ${result.draftId}${colors.reset}`);
+      if (to.length > 0) log(`  ${colors.dim}To: ${to.join(", ")}${colors.reset}`);
+      if (subject) log(`  ${colors.dim}Subject: ${subject}${colors.reset}`);
+      if (accountEmail) log(`  ${colors.dim}Account: ${accountEmail}${colors.reset}`);
+    } else {
+      error(`Failed to create draft: ${result.error}`);
+    }
+  }
+}
+
+
 
 async function cmdDraft(options: CliOptions) {
   // If updating an existing draft
   if (options.updateDraftId) {
-    const conn = await checkConnection(options.port);
-    if (!conn) {
-      process.exit(1);
-    }
+    const provider = await getProvider(options);
 
     // Resolve names to emails
-    const resolvedTo = options.to.length > 0 ? await resolveAllRecipients(conn, options.to) : undefined;
-    const resolvedCc = options.cc.length > 0 ? await resolveAllRecipients(conn, options.cc) : undefined;
-    const resolvedBcc = options.bcc.length > 0 ? await resolveAllRecipients(conn, options.bcc) : undefined;
+    const resolvedTo = options.to.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.to) : undefined;
+    const resolvedCc = options.cc.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.cc) : undefined;
+    const resolvedBcc = options.bcc.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.bcc) : undefined;
 
     // Use HTML body if provided, otherwise convert plain text to HTML (if body provided)
     const bodyContent = options.html || (options.body ? textToHtml(options.body) : undefined);
 
     info(`Updating draft ${options.updateDraftId}...`);
-    const result = await updateDraft(conn, options.updateDraftId, {
+    const result = await updateDraftViaProvider(provider, options.updateDraftId, {
       to: resolvedTo,
       cc: resolvedCc,
       bcc: resolvedBcc,
@@ -885,7 +984,7 @@ async function cmdDraft(options: CliOptions) {
       error(`Failed to update draft: ${result.error}`);
     }
 
-    await disconnect(conn);
+    await provider.disconnect();
     return;
   }
 
@@ -899,8 +998,8 @@ async function cmdDraft(options: CliOptions) {
   // This avoids CDP connection entirely for Superhuman drafts
   if (options.account && options.provider === "superhuman") {
     await loadTokensFromDisk();
-    if (hasCachedSuperhumanCredentials(options.account)) {
-      const token = getCachedToken(options.account);
+    if (await hasCachedSuperhumanCredentials(options.account)) {
+      const token = await getCachedToken(options.account);
       if (token?.idToken && token?.userId) {
         info("Creating draft via cached credentials (no CDP)...");
 
@@ -934,15 +1033,12 @@ async function cmdDraft(options: CliOptions) {
     }
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   // Resolve names to emails
-  const resolvedTo = await resolveAllRecipients(conn, options.to);
-  const resolvedCc = options.cc.length > 0 ? await resolveAllRecipients(conn, options.cc) : undefined;
-  const resolvedBcc = options.bcc.length > 0 ? await resolveAllRecipients(conn, options.bcc) : undefined;
+  const resolvedTo = await resolveAllRecipientsViaProvider(provider, options.to);
+  const resolvedCc = options.cc.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.cc) : undefined;
+  const resolvedBcc = options.bcc.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.bcc) : undefined;
 
   // Use HTML body if provided, otherwise convert plain text to HTML
   const bodyContent = options.html || textToHtml(options.body);
@@ -951,7 +1047,7 @@ async function cmdDraft(options: CliOptions) {
     // Direct API approach - fast, no UI needed, supports BCC
     info("Creating draft via Superhuman API...");
 
-    const result = await createDraftDirect(conn, {
+    const result = await createDraftViaProvider(provider, {
       to: resolvedTo,
       cc: resolvedCc,
       bcc: resolvedBcc,
@@ -969,7 +1065,7 @@ async function cmdDraft(options: CliOptions) {
   } else {
     // Direct API approach (Gmail/MS Graph)
     info("Creating draft via Gmail/MS Graph API...");
-    const result = await createDraft(conn, {
+    const result = await createDraftViaProvider(provider, {
       to: resolvedTo,
       cc: resolvedCc,
       bcc: resolvedBcc,
@@ -988,7 +1084,7 @@ async function cmdDraft(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdDeleteDraft(options: CliOptions) {
@@ -996,18 +1092,15 @@ async function cmdDeleteDraft(options: CliOptions) {
 
   if (draftIds.length === 0) {
     error("At least one draft ID is required");
-    error("Usage: superhuman delete-draft <draft-id> [draft-id...]");
+    error("Usage: superhuman draft delete <draft-id> [draft-id...]");
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   for (const draftId of draftIds) {
     info(`Deleting draft ${draftId.slice(-15)}...`);
-    const result = await deleteDraft(conn, draftId);
+    const result = await deleteDraftViaProvider(provider, draftId);
 
     if (result.success) {
       success(`Deleted draft ${draftId.slice(-15)}`);
@@ -1016,7 +1109,7 @@ async function cmdDeleteDraft(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdSendDraft(options: CliOptions) {
@@ -1025,7 +1118,7 @@ async function cmdSendDraft(options: CliOptions) {
   // Validate draft ID is provided
   if (!draftId) {
     error("Draft ID is required");
-    error("Usage: superhuman send-draft <draft-id> --account=<email> --to=<recipient> --subject=<subject> --body=<body>");
+    error("Usage: superhuman draft send <draft-id> --account=<email> --to=<recipient> --subject=<subject> --body=<body>");
     process.exit(1);
   }
 
@@ -1061,7 +1154,7 @@ async function cmdSendDraft(options: CliOptions) {
 
   // Load cached credentials
   await loadTokensFromDisk();
-  const token = getCachedToken(options.account);
+  const token = await getCachedToken(options.account);
   if (!token?.idToken || !token?.userId) {
     error(`No cached credentials for ${options.account}. Run 'superhuman auth' first.`);
     process.exit(1);
@@ -1109,13 +1202,10 @@ async function cmdSendDraft(options: CliOptions) {
 async function cmdSend(options: CliOptions) {
   // If sending an existing draft by ID
   if (options.sendDraftId) {
-    const conn = await checkConnection(options.port);
-    if (!conn) {
-      process.exit(1);
-    }
+    const provider = await getProvider(options);
 
     info(`Sending draft ${options.sendDraftId}...`);
-    const result = await sendDraftById(conn, options.sendDraftId);
+    const result = await sendDraftByIdViaProvider(provider, options.sendDraftId);
 
     if (result.success) {
       success("Draft sent!");
@@ -1126,7 +1216,7 @@ async function cmdSend(options: CliOptions) {
       error(`Failed to send draft: ${result.error}`);
     }
 
-    await disconnect(conn);
+    await provider.disconnect();
     return;
   }
 
@@ -1136,21 +1226,18 @@ async function cmdSend(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   // Resolve names to emails
-  const resolvedTo = await resolveAllRecipients(conn, options.to);
-  const resolvedCc = options.cc.length > 0 ? await resolveAllRecipients(conn, options.cc) : undefined;
-  const resolvedBcc = options.bcc.length > 0 ? await resolveAllRecipients(conn, options.bcc) : undefined;
+  const resolvedTo = await resolveAllRecipientsViaProvider(provider, options.to);
+  const resolvedCc = options.cc.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.cc) : undefined;
+  const resolvedBcc = options.bcc.length > 0 ? await resolveAllRecipientsViaProvider(provider, options.bcc) : undefined;
 
   // Use HTML body if provided, otherwise convert plain text to HTML
   const bodyContent = options.html || textToHtml(options.body);
 
   info("Sending email...");
-  const result = await sendEmail(conn, {
+  const result = await sendEmailViaProvider(provider, {
     to: resolvedTo,
     cc: resolvedCc,
     bcc: resolvedBcc,
@@ -1168,7 +1255,7 @@ async function cmdSend(options: CliOptions) {
     error(`Failed to send: ${result.error}`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 function formatDate(dateStr: string): string {
@@ -1189,12 +1276,9 @@ function truncate(str: string | null | undefined, maxLen: number): string {
 }
 
 async function cmdInbox(options: CliOptions) {
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const threads = await listInbox(conn, { limit: options.limit });
+  const threads = await listInbox(provider, { limit: options.limit });
 
   if (options.json) {
     console.log(JSON.stringify(threads, null, 2));
@@ -1217,7 +1301,7 @@ async function cmdInbox(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdSearch(options: CliOptions) {
@@ -1227,12 +1311,9 @@ async function cmdSearch(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const threads = await searchInbox(conn, {
+  const threads = await searchInbox(provider, {
     query: options.query,
     limit: options.limit,
     includeDone: options.includeDone,
@@ -1259,52 +1340,67 @@ async function cmdSearch(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
+
+const READ_USAGE = `Usage: superhuman read <thread-id> [--account <email>] [--context N]`;
 
 async function cmdRead(options: CliOptions) {
   if (!options.threadId) {
     error("Thread ID is required");
-    console.log(`Usage: superhuman read <thread-id>`);
+    console.log(READ_USAGE);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
+  const provider = await getProvider(options);
+  const token = await provider.getToken();
+
+  let messages;
+  try {
+    messages = await getThreadMessages(token, options.threadId);
+  } catch (e) {
+    error(`Failed to fetch thread: ${e instanceof Error ? e.message : e}`);
     process.exit(1);
   }
-
-  const messages = await readThread(conn, options.threadId);
 
   if (options.json) {
     console.log(JSON.stringify(messages, null, 2));
-  } else {
-    if (messages.length === 0) {
-      error("Thread not found or no messages");
+    return;
+  }
+
+  if (messages.length === 0) {
+    error("Thread not found or no messages");
+    return;
+  }
+
+  const contextCount = options.context;
+  const separator = "\n" + colors.dim + "─".repeat(60) + colors.reset + "\n";
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (i > 0) {
+      console.log(separator);
+    }
+    console.log(`${colors.bold}${msg.subject}${colors.reset}`);
+    console.log(`${colors.cyan}From:${colors.reset} ${msg.from.name} <${msg.from.email}>`);
+    console.log(`${colors.cyan}To:${colors.reset} ${msg.to.map((r) => r.email).join(", ")}`);
+    if (msg.cc.length > 0) {
+      console.log(`${colors.cyan}Cc:${colors.reset} ${msg.cc.map((r) => r.email).join(", ")}`);
+    }
+    console.log(`${colors.cyan}Date:${colors.reset} ${new Date(msg.date).toLocaleString()}`);
+    console.log();
+
+    // When contextCount is 0 (default), show full body for all messages.
+    // Otherwise, show full body only for the last N messages.
+    const isWithinContext = contextCount === 0 || (messages.length - i) <= contextCount;
+    if (isWithinContext && msg.body) {
+      console.log(msg.body);
     } else {
-      for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        if (i > 0) {
-          console.log("\n" + colors.dim + "─".repeat(60) + colors.reset + "\n");
-        }
-        console.log(`${colors.bold}${msg.subject}${colors.reset}`);
-        console.log(`${colors.cyan}From:${colors.reset} ${msg.from.name} <${msg.from.email}>`);
-        console.log(
-          `${colors.cyan}To:${colors.reset} ${msg.to.map((r) => r.email).join(", ")}`
-        );
-        if (msg.cc.length > 0) {
-          console.log(
-            `${colors.cyan}Cc:${colors.reset} ${msg.cc.map((r) => r.email).join(", ")}`
-          );
-        }
-        console.log(`${colors.cyan}Date:${colors.reset} ${new Date(msg.date).toLocaleString()}`);
-        console.log();
-        console.log(msg.snippet);
-      }
+      console.log(msg.snippet);
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdReply(options: CliOptions) {
@@ -1317,8 +1413,8 @@ async function cmdReply(options: CliOptions) {
   // Fast path: use cached credentials if --account is specified
   if (options.account) {
     await loadTokensFromDisk();
-    if (hasCachedSuperhumanCredentials(options.account)) {
-      const token = getCachedToken(options.account);
+    if (await hasCachedSuperhumanCredentials(options.account)) {
+      const token = await getCachedToken(options.account);
       if (token?.idToken && token?.userId) {
         const body = options.body || "";
 
@@ -1399,16 +1495,13 @@ async function cmdReply(options: CliOptions) {
   }
 
   // CDP path (original behavior)
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   const body = options.body || "";
   const action = options.send ? "Sending" : "Creating draft for";
   info(`${action} reply to thread ${options.threadId}...`);
 
-  const result = await replyToThread(conn, options.threadId, body, options.send);
+  const result = await replyToThread(provider, options.threadId, body, options.send);
 
   if (result.success) {
     if (options.send) {
@@ -1420,7 +1513,7 @@ async function cmdReply(options: CliOptions) {
     error(result.error || "Failed to create reply");
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdReplyAll(options: CliOptions) {
@@ -1433,8 +1526,8 @@ async function cmdReplyAll(options: CliOptions) {
   // Fast path: use cached credentials if --account is specified
   if (options.account) {
     await loadTokensFromDisk();
-    if (hasCachedSuperhumanCredentials(options.account)) {
-      const token = getCachedToken(options.account);
+    if (await hasCachedSuperhumanCredentials(options.account)) {
+      const token = await getCachedToken(options.account);
       if (token?.idToken && token?.userId) {
         const body = options.body || "";
 
@@ -1513,7 +1606,7 @@ async function cmdReplyAll(options: CliOptions) {
             to: uniqueRecipients,
             subject,
             body: textToHtml(body),
-            action: "reply-all",
+            action: "reply" as const,  // reply-all uses reply action
             inReplyToThreadId: options.threadId,
             inReplyToRfc822Id: threadInfo.messageId || undefined,
           });
@@ -1535,16 +1628,13 @@ async function cmdReplyAll(options: CliOptions) {
   }
 
   // CDP path (original behavior)
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   const body = options.body || "";
   const action = options.send ? "Sending" : "Creating draft for";
   info(`${action} reply-all to thread ${options.threadId}...`);
 
-  const result = await replyAllToThread(conn, options.threadId, body, options.send);
+  const result = await replyAllToThread(provider, options.threadId, body, options.send);
 
   if (result.success) {
     if (options.send) {
@@ -1556,7 +1646,7 @@ async function cmdReplyAll(options: CliOptions) {
     error(result.error || "Failed to create reply-all");
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdForward(options: CliOptions) {
@@ -1575,8 +1665,8 @@ async function cmdForward(options: CliOptions) {
   // Fast path: use cached credentials if --account is specified
   if (options.account) {
     await loadTokensFromDisk();
-    if (hasCachedSuperhumanCredentials(options.account)) {
-      const token = getCachedToken(options.account);
+    if (await hasCachedSuperhumanCredentials(options.account)) {
+      const token = await getCachedToken(options.account);
       if (token?.idToken && token?.userId) {
         const body = options.body || "";
 
@@ -1654,20 +1744,17 @@ async function cmdForward(options: CliOptions) {
   }
 
   // CDP path (original behavior)
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   // Resolve name to email
-  const resolvedTo = await resolveAllRecipients(conn, options.to);
+  const resolvedTo = await resolveAllRecipientsViaProvider(provider, options.to);
   const toEmail = resolvedTo[0]; // Use first recipient for forward
 
   const body = options.body || "";
   const action = options.send ? "Sending" : "Creating draft for";
   info(`${action} forward to ${toEmail}...`);
 
-  const result = await forwardThread(conn, options.threadId, toEmail, body, options.send);
+  const result = await forwardThread(provider, options.threadId, toEmail, body, options.send);
 
   if (result.success) {
     if (options.send) {
@@ -1679,7 +1766,7 @@ async function cmdForward(options: CliOptions) {
     error(result.error || "Failed to create forward");
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdArchive(options: CliOptions) {
@@ -1689,16 +1776,13 @@ async function cmdArchive(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await archiveThread(conn, threadId);
+    const result = await archiveThread(provider, threadId);
     if (result.success) {
       success(`Archived: ${threadId}`);
       successCount++;
@@ -1712,7 +1796,7 @@ async function cmdArchive(options: CliOptions) {
     log(`\n${successCount} archived, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdDelete(options: CliOptions) {
@@ -1722,16 +1806,13 @@ async function cmdDelete(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await deleteThread(conn, threadId);
+    const result = await deleteThread(provider, threadId);
     if (result.success) {
       success(`Deleted: ${threadId}`);
       successCount++;
@@ -1745,26 +1826,23 @@ async function cmdDelete(options: CliOptions) {
     log(`\n${successCount} deleted, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdMarkRead(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman mark-read <thread-id> [thread-id...]`);
+    console.log(`Usage: superhuman mark read <thread-id> [thread-id...]`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await markAsRead(conn, threadId);
+    const result = await markAsRead(provider, threadId);
     if (result.success) {
       success(`Marked as read: ${threadId}`);
       successCount++;
@@ -1778,26 +1856,23 @@ async function cmdMarkRead(options: CliOptions) {
     log(`\n${successCount} marked as read, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdMarkUnread(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman mark-unread <thread-id> [thread-id...]`);
+    console.log(`Usage: superhuman mark unread <thread-id> [thread-id...]`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await markAsUnread(conn, threadId);
+    const result = await markAsUnread(provider, threadId);
     if (result.success) {
       success(`Marked as unread: ${threadId}`);
       successCount++;
@@ -1811,16 +1886,13 @@ async function cmdMarkUnread(options: CliOptions) {
     log(`\n${successCount} marked as unread, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdLabels(options: CliOptions) {
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const labels = await listLabels(conn);
+  const labels = await listLabels(provider);
 
   if (options.json) {
     console.log(JSON.stringify(labels, null, 2));
@@ -1837,22 +1909,19 @@ async function cmdLabels(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdGetLabels(options: CliOptions) {
   if (!options.threadId) {
     error("Thread ID is required");
-    console.log(`Usage: superhuman get-labels <thread-id>`);
+    console.log(`Usage: superhuman label get <thread-id>`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const labels = await getThreadLabels(conn, options.threadId);
+  const labels = await getThreadLabels(provider, options.threadId);
 
   if (options.json) {
     console.log(JSON.stringify(labels, null, 2));
@@ -1869,32 +1938,29 @@ async function cmdGetLabels(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdAddLabel(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman add-label <thread-id> [thread-id...] --label <label-id>`);
+    console.log(`Usage: superhuman label add <thread-id> [thread-id...] --label <label-id>`);
     process.exit(1);
   }
 
   if (!options.labelId) {
     error("Label ID is required (--label)");
-    console.log(`Usage: superhuman add-label <thread-id> [thread-id...] --label <label-id>`);
+    console.log(`Usage: superhuman label add <thread-id> [thread-id...] --label <label-id>`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await addLabel(conn, threadId, options.labelId);
+    const result = await addLabel(provider, threadId, options.labelId);
     if (result.success) {
       success(`Added label to: ${threadId}`);
       successCount++;
@@ -1908,32 +1974,29 @@ async function cmdAddLabel(options: CliOptions) {
     log(`\n${successCount} labeled, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdRemoveLabel(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman remove-label <thread-id> [thread-id...] --label <label-id>`);
+    console.log(`Usage: superhuman label remove <thread-id> [thread-id...] --label <label-id>`);
     process.exit(1);
   }
 
   if (!options.labelId) {
     error("Label ID is required (--label)");
-    console.log(`Usage: superhuman remove-label <thread-id> [thread-id...] --label <label-id>`);
+    console.log(`Usage: superhuman label remove <thread-id> [thread-id...] --label <label-id>`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await removeLabel(conn, threadId, options.labelId);
+    const result = await removeLabel(provider, threadId, options.labelId);
     if (result.success) {
       success(`Removed label from: ${threadId}`);
       successCount++;
@@ -1947,26 +2010,23 @@ async function cmdRemoveLabel(options: CliOptions) {
     log(`\n${successCount} updated, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdStar(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman star <thread-id> [thread-id...]`);
+    console.log(`Usage: superhuman star add <thread-id> [thread-id...]`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await starThread(conn, threadId);
+    const result = await starThread(provider, threadId);
     if (result.success) {
       success(`Starred thread: ${threadId}`);
       successCount++;
@@ -1980,26 +2040,23 @@ async function cmdStar(options: CliOptions) {
     log(`\n${successCount} starred, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdUnstar(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman unstar <thread-id> [thread-id...]`);
+    console.log(`Usage: superhuman star remove <thread-id> [thread-id...]`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
   for (const threadId of options.threadIds) {
-    const result = await unstarThread(conn, threadId);
+    const result = await unstarThread(provider, threadId);
     if (result.success) {
       success(`Unstarred thread: ${threadId}`);
       successCount++;
@@ -2013,16 +2070,13 @@ async function cmdUnstar(options: CliOptions) {
     log(`\n${successCount} unstarred, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdStarred(options: CliOptions) {
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const threads = await listStarred(conn, options.limit);
+  const threads = await listStarred(provider, options.limit);
 
   if (options.json) {
     console.log(JSON.stringify(threads, null, 2));
@@ -2037,19 +2091,19 @@ async function cmdStarred(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdSnooze(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman snooze <thread-id> [thread-id...] --until <time>`);
+    console.log(`Usage: superhuman snooze set <thread-id> [thread-id...] --until <time>`);
     process.exit(1);
   }
 
   if (!options.snoozeUntil) {
     error("Snooze time is required (--until)");
-    console.log(`Usage: superhuman snooze <thread-id> --until <time>`);
+    console.log(`Usage: superhuman snooze set <thread-id> --until <time>`);
     console.log(`  Presets: tomorrow, next-week, weekend, evening`);
     console.log(`  Or use ISO datetime: 2024-02-15T14:00:00Z`);
     process.exit(1);
@@ -2063,16 +2117,15 @@ async function cmdSnooze(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
-  for (const threadId of options.threadIds) {
-    const result = await snoozeThread(conn, threadId, snoozeTime);
+  const results = await snoozeThreadViaProvider(provider, options.threadIds, snoozeTime);
+  for (let i = 0; i < options.threadIds.length; i++) {
+    const threadId = options.threadIds[i];
+    const result = results[i];
     if (result.success) {
       success(`Snoozed thread: ${threadId} until ${snoozeTime.toLocaleString()}`);
       successCount++;
@@ -2086,26 +2139,25 @@ async function cmdSnooze(options: CliOptions) {
     log(`\n${successCount} snoozed, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdUnsnooze(options: CliOptions) {
   if (options.threadIds.length === 0) {
     error("At least one thread ID is required");
-    console.log(`Usage: superhuman unsnooze <thread-id> [thread-id...]`);
+    console.log(`Usage: superhuman snooze cancel <thread-id> [thread-id...]`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   let successCount = 0;
   let failCount = 0;
 
-  for (const threadId of options.threadIds) {
-    const result = await unsnoozeThread(conn, threadId);
+  const results = await unsnoozeThreadViaProvider(provider, options.threadIds);
+  for (let i = 0; i < options.threadIds.length; i++) {
+    const threadId = options.threadIds[i];
+    const result = results[i];
     if (result.success) {
       success(`Unsnoozed thread: ${threadId}`);
       successCount++;
@@ -2119,16 +2171,13 @@ async function cmdUnsnooze(options: CliOptions) {
     log(`\n${successCount} unsnoozed, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdSnoozed(options: CliOptions) {
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const threads = await listSnoozed(conn, options.limit);
+  const threads = await listSnoozedViaProvider(provider, options.limit);
 
   if (options.json) {
     console.log(JSON.stringify(threads, null, 2));
@@ -2146,7 +2195,7 @@ async function cmdSnoozed(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 function formatFileSize(bytes: number): string {
@@ -2158,16 +2207,13 @@ function formatFileSize(bytes: number): string {
 async function cmdAttachments(options: CliOptions) {
   if (!options.threadId) {
     error("Thread ID is required");
-    console.log(`Usage: superhuman attachments <thread-id>`);
+    console.log(`Usage: superhuman attachment list <thread-id>`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const attachments = await listAttachments(conn, options.threadId);
+  const attachments = await listAttachments(provider, options.threadId);
 
   if (options.json) {
     console.log(JSON.stringify(attachments, null, 2));
@@ -2185,7 +2231,7 @@ async function cmdAttachments(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdDownload(options: CliOptions) {
@@ -2193,18 +2239,15 @@ async function cmdDownload(options: CliOptions) {
   if (options.attachmentId) {
     if (!options.messageId) {
       error("Message ID is required when using --attachment");
-      console.log(`Usage: superhuman download --attachment <attachment-id> --message <message-id> --output <path>`);
+      console.log(`Usage: superhuman attachment download --attachment <attachment-id> --message <message-id> --output <path>`);
       process.exit(1);
     }
 
-    const conn = await checkConnection(options.port);
-    if (!conn) {
-      process.exit(1);
-    }
+    const provider = await getProvider(options);
 
     try {
       info(`Downloading attachment ${options.attachmentId}...`);
-      const content = await downloadAttachment(conn, options.messageId, options.attachmentId);
+      const content = await downloadAttachment(provider, options.messageId, options.attachmentId);
       const outputPath = options.outputPath || `attachment-${options.attachmentId}`;
       await Bun.write(outputPath, Buffer.from(content.data, "base64"));
       success(`Downloaded: ${outputPath} (${formatFileSize(content.size)})`);
@@ -2212,28 +2255,25 @@ async function cmdDownload(options: CliOptions) {
       error(`Failed to download: ${(e as Error).message}`);
     }
 
-    await disconnect(conn);
+    await provider.disconnect();
     return;
   }
 
   // Mode 2: Download all attachments from a thread
   if (!options.threadId) {
     error("Thread ID is required, or use --attachment with --message");
-    console.log(`Usage: superhuman download <thread-id> [--output <dir>]`);
-    console.log(`       superhuman download --attachment <id> --message <id> --output <path>`);
+    console.log(`Usage: superhuman attachment download <thread-id> [--output <dir>]`);
+    console.log(`       superhuman attachment download --attachment <id> --message <id> --output <path>`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const attachments = await listAttachments(conn, options.threadId);
+  const attachments = await listAttachments(provider, options.threadId);
 
   if (attachments.length === 0) {
     info("No attachments in this thread");
-    await disconnect(conn);
+    await provider.disconnect();
     return;
   }
 
@@ -2245,7 +2285,7 @@ async function cmdDownload(options: CliOptions) {
     try {
       info(`Downloading ${att.name}...`);
       const content = await downloadAttachment(
-        conn,
+        provider,
         att.messageId,
         att.attachmentId,
         att.threadId,
@@ -2265,7 +2305,7 @@ async function cmdDownload(options: CliOptions) {
     log(`\n${successCount} downloaded, ${failCount} failed`);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 /**
@@ -2328,7 +2368,7 @@ async function cmdAccounts(options: CliOptions) {
 async function cmdAccount(options: CliOptions) {
   if (!options.accountArg) {
     error("Account index or email is required");
-    console.log(`Usage: superhuman account <index|email>`);
+    console.log(`Usage: superhuman account switch <index|email>`);
     process.exit(1);
   }
 
@@ -2553,10 +2593,7 @@ async function resolveCalendarId(conn: SuperhumanConnection, arg: string): Promi
 }
 
 async function cmdCalendar(options: CliOptions) {
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   // Parse date range
   let timeMin: Date;
@@ -2573,15 +2610,27 @@ async function cmdCalendar(options: CliOptions) {
   timeMax.setDate(timeMax.getDate() + options.calendarRange);
   timeMax.setHours(23, 59, 59, 999);
 
-  // Resolve calendar ID if provided
-  const calendarId = await resolveCalendarId(conn, options.calendarArg);
+  // Resolve calendar ID if provided (requires CDP for name resolution)
+  let calendarId: string | null = null;
+  if (options.calendarArg && provider instanceof CDPConnectionProvider) {
+    calendarId = await resolveCalendarId(provider.getConnection(), options.calendarArg);
+  } else if (options.calendarArg) {
+    // Without CDP, use the arg as-is (must be an ID)
+    calendarId = options.calendarArg;
+  }
 
   let allEvents: CalendarEvent[] = [];
 
   if (options.allAccounts) {
-    // Get all accounts and query each
+    // All-accounts mode requires CDP for account switching
+    if (!(provider instanceof CDPConnectionProvider)) {
+      error("--all-accounts requires Superhuman running with CDP");
+      await provider.disconnect();
+      process.exit(1);
+    }
+    const conn = provider.getConnection();
     const accounts = await listAccounts(conn);
-    const originalAccount = accounts.find(a => a.current)?.email;
+    const originalAccount = accounts.find(a => a.isCurrent)?.email;
 
     for (const account of accounts) {
       // Switch to this account
@@ -2589,7 +2638,7 @@ async function cmdCalendar(options: CliOptions) {
       // Small delay for account switch to take effect
       await new Promise(r => setTimeout(r, 300));
 
-      const events = await listEvents(conn, { timeMin, timeMax });
+      const events = await listEvents(provider, { timeMin, timeMax });
       // Tag events with account info
       for (const event of events) {
         (event as CalendarEvent & { account?: string }).account = account.email;
@@ -2602,7 +2651,7 @@ async function cmdCalendar(options: CliOptions) {
       await switchAccount(conn, originalAccount);
     }
   } else {
-    allEvents = await listEvents(conn, { timeMin, timeMax, calendarId: calendarId || undefined });
+    allEvents = await listEvents(provider, { timeMin, timeMax, calendarId: calendarId || undefined });
   }
 
   // Sort all events by start time
@@ -2637,7 +2686,7 @@ async function cmdCalendar(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdCalendarCreate(options: CliOptions) {
@@ -2646,9 +2695,20 @@ async function cmdCalendarCreate(options: CliOptions) {
     process.exit(1);
   }
 
+  const provider = await getProvider(options);
+
   const title = options.eventTitle || options.subject;
   let startTime: Date;
   let endTime: Date;
+
+  // Resolve calendar ID if provided (requires CDP for name resolution)
+  let calendarId: string | null = null;
+  if (options.calendarArg && provider instanceof CDPConnectionProvider) {
+    calendarId = await resolveCalendarId(provider.getConnection(), options.calendarArg);
+  } else if (options.calendarArg) {
+    calendarId = options.calendarArg;
+  }
+
 
   // Determine if this is an all-day event
   const isAllDay = options.calendarDate && !options.eventStart;
@@ -2664,6 +2724,7 @@ async function cmdCalendarCreate(options: CliOptions) {
   } else {
     if (!options.eventStart) {
       error("Event start time is required (--start) or use --date for all-day event");
+      await provider.disconnect();
       process.exit(1);
     }
 
@@ -2724,17 +2785,15 @@ async function cmdCalendarCreate(options: CliOptions) {
     process.exit(1);
   }
 
-  // Resolve calendar ID if provided
-  const calendarId = await resolveCalendarId(conn, options.calendarArg);
-  const eventInput = buildEventInput(calendarId);
+  const eventInput = buildEventInput(calendarId || undefined);
 
   // Add attendees from --to option (resolve names to emails)
   if (options.to.length > 0) {
-    const resolvedAttendees = await resolveAllRecipients(conn, options.to);
+    const resolvedAttendees = await resolveAllRecipientsViaProvider(provider, options.to);
     eventInput.attendees = resolvedAttendees.map(email => ({ email }));
   }
 
-  const result = await createEvent(conn, eventInput);
+  const result = await createEvent(provider, eventInput);
 
   if (result.success) {
     success(`Event created: ${result.eventId}`);
@@ -2748,7 +2807,7 @@ async function cmdCalendarCreate(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdCalendarUpdate(options: CliOptions) {
@@ -2757,10 +2816,7 @@ async function cmdCalendarUpdate(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   const updates: UpdateEventInput = {};
 
@@ -2785,17 +2841,17 @@ async function cmdCalendarUpdate(options: CliOptions) {
     updates.end = { dateTime: endTime.toISOString() };
   }
   if (options.to.length > 0) {
-    const resolvedAttendees = await resolveAllRecipients(conn, options.to);
+    const resolvedAttendees = await resolveAllRecipientsViaProvider(provider, options.to);
     updates.attendees = resolvedAttendees.map(email => ({ email }));
   }
 
   if (Object.keys(updates).length === 0) {
     error("No updates specified. Use --title, --start, --end, --body, or --to");
-    await disconnect(conn);
+    await provider.disconnect();
     process.exit(1);
   }
 
-  const result = await updateEvent(conn, options.eventId, updates);
+  const result = await updateEvent(provider, options.eventId, updates);
 
   if (result.success) {
     success(`Event updated: ${result.eventId}`);
@@ -2809,7 +2865,7 @@ async function cmdCalendarUpdate(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdCalendarDelete(options: CliOptions) {
@@ -2818,12 +2874,9 @@ async function cmdCalendarDelete(options: CliOptions) {
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
-  const result = await deleteCalendarEvent(conn, options.eventId);
+  const result = await deleteCalendarEvent(provider, options.eventId);
 
   if (result.success) {
     success(`Event deleted: ${options.eventId}`);
@@ -2834,7 +2887,7 @@ async function cmdCalendarDelete(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 /**
@@ -2848,35 +2901,32 @@ function formatContact(contact: Contact): string {
 }
 
 async function cmdContacts(options: CliOptions) {
-  if (options.contactsSubcommand !== "search") {
-    error("Unknown contacts subcommand: " + (options.contactsSubcommand || "(none)"));
-    console.log(`Usage: superhuman contacts search <query>`);
+  if (options.subcommand !== "search") {
+    error("Unknown subcommand: contact " + (options.subcommand || "(none)"));
+    console.log(`Usage: superhuman contact search <query>`);
     process.exit(1);
   }
 
   if (!options.contactsQuery) {
     error("Search query is required");
-    console.log(`Usage: superhuman contacts search <query>`);
+    console.log(`Usage: superhuman contact search <query>`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   try {
     let contacts: Contact[];
 
     if (options.account) {
       // Use direct API with specified account
-      const { getToken, searchContactsDirect, clearTokenCache } = await import("./token-api");
-      const token = await getToken(conn, options.account);
+      const { searchContactsDirect } = await import("./token-api");
+      const token = await provider.getToken(options.account);
       contacts = await searchContactsDirect(token, options.contactsQuery, options.limit);
       info(`Searching contacts in account: ${options.account}`);
     } else {
       // Use existing DI-based approach (current account)
-      contacts = await searchContacts(conn, options.contactsQuery, { limit: options.limit });
+      contacts = await searchContacts(provider, options.contactsQuery, { limit: options.limit });
     }
 
     if (options.json) {
@@ -2891,65 +2941,53 @@ async function cmdContacts(options: CliOptions) {
       }
     }
   } finally {
-    await disconnect(conn);
+    await provider.disconnect();
   }
 }
 
 async function cmdAi(options: CliOptions) {
-  if (!options.threadId) {
-    error("Thread ID is required");
-    console.log(`Usage: superhuman ai <thread-id> "question"`);
-    process.exit(1);
-  }
-
   if (!options.aiQuery) {
-    error("Question is required");
-    console.log(`Usage: superhuman ai <thread-id> "question"`);
+    error("Prompt is required");
+    console.log(`Usage: superhuman ai "prompt"                    (compose from scratch)`);
+    console.log(`       superhuman ai <thread-id> "prompt"        (reply to a thread)`);
     console.log(`\nExamples:`);
+    console.log(`  superhuman ai "Write an email inviting the team to a planning meeting"`);
     console.log(`  superhuman ai <thread-id> "summarize this thread"`);
-    console.log(`  superhuman ai <thread-id> "what are the action items?"`);
     console.log(`  superhuman ai <thread-id> "draft a reply"`);
     process.exit(1);
   }
 
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   try {
-    // Get OAuth token for thread content access
-    const accounts = await listAccounts(conn);
-    const currentAccount = accounts.find((a) => a.isCurrent);
-    if (!currentAccount) {
-      error("No active account found");
-      await disconnect(conn);
-      process.exit(1);
+    // Get OAuth token
+    if (options.threadId) {
+      info(`Fetching thread context...`);
     }
-
-    info(`Fetching thread context...`);
-    const oauthToken = await getToken(conn, currentAccount.email);
+    const oauthToken = await provider.getToken();
 
     // Get Superhuman backend token for AI API
-    info(`Connecting to Superhuman AI...`);
-    const shToken = await extractSuperhumanToken(conn, currentAccount.email);
-
-    // Extract user prefix for valid event ID generation
-    const userPrefix = await extractUserPrefix(conn);
-    if (!userPrefix) {
-      error("Could not extract user prefix for AI API");
-      await disconnect(conn);
+    // Try cached idToken first, fall back to CDP extraction
+    let superhumanToken: string;
+    if (oauthToken.idToken) {
+      superhumanToken = oauthToken.idToken;
+    } else if (provider instanceof CDPConnectionProvider) {
+      info(`Connecting to Superhuman AI...`);
+      const shToken = await extractSuperhumanToken(provider.getConnection(), oauthToken.email);
+      superhumanToken = shToken.token;
+    } else {
+      error("Superhuman backend credentials required for AI. Run 'superhuman account auth'.");
+      await provider.disconnect();
       process.exit(1);
     }
 
     // Query the AI
     info(`Asking AI: "${options.aiQuery}"`);
     const result = await askAI(
-      shToken.token,
+      superhumanToken,
       oauthToken,
       options.threadId,
       options.aiQuery,
-      { userPrefix }
     );
 
     // Display the response
@@ -2958,18 +2996,15 @@ async function cmdAi(options: CliOptions) {
     console.log(`\n${colors.dim}Session: ${result.sessionId}${colors.reset}`);
   } catch (e) {
     error(`AI query failed: ${(e as Error).message}`);
-    await disconnect(conn);
+    await provider.disconnect();
     process.exit(1);
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 async function cmdCalendarFree(options: CliOptions) {
-  const conn = await checkConnection(options.port);
-  if (!conn) {
-    process.exit(1);
-  }
+  const provider = await getProvider(options);
 
   // Parse date range
   let timeMin: Date;
@@ -2984,7 +3019,7 @@ async function cmdCalendarFree(options: CliOptions) {
   timeMax = new Date(timeMin);
   timeMax.setDate(timeMax.getDate() + options.calendarRange);
 
-  const result = await getFreeBusy(conn, { timeMin, timeMax });
+  const result = await getFreeBusy(provider, { timeMin, timeMax });
 
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -3001,7 +3036,7 @@ async function cmdCalendarFree(options: CliOptions) {
     }
   }
 
-  await disconnect(conn);
+  await provider.disconnect();
 }
 
 export async function main() {
@@ -3030,16 +3065,23 @@ export async function main() {
       await cmdStatus(options);
       break;
 
-    case "auth":
-      await cmdAuth(options);
-      break;
-
-    case "accounts":
-      await cmdAccounts(options);
-      break;
-
+    // account list|switch|auth
     case "account":
-      await cmdAccount(options);
+      switch (options.subcommand) {
+        case "list":
+          await cmdAccounts(options);
+          break;
+        case "switch":
+          await cmdAccount(options);
+          break;
+        case "auth":
+          await cmdAuth(options);
+          break;
+        default:
+          error(`Unknown subcommand: account ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman account list|switch|auth`);
+          process.exit(1);
+      }
       break;
 
     case "inbox":
@@ -3074,105 +3116,178 @@ export async function main() {
       await cmdDelete(options);
       break;
 
-    case "mark-read":
-      await cmdMarkRead(options);
+    // mark read|unread
+    case "mark":
+      switch (options.subcommand) {
+        case "read":
+          await cmdMarkRead(options);
+          break;
+        case "unread":
+          await cmdMarkUnread(options);
+          break;
+        default:
+          error(`Unknown subcommand: mark ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman mark read|unread <thread-id>`);
+          process.exit(1);
+      }
       break;
 
-    case "mark-unread":
-      await cmdMarkUnread(options);
+    // label list|get|add|remove
+    case "label":
+      switch (options.subcommand) {
+        case "list":
+          await cmdLabels(options);
+          break;
+        case "get":
+          await cmdGetLabels(options);
+          break;
+        case "add":
+          await cmdAddLabel(options);
+          break;
+        case "remove":
+          await cmdRemoveLabel(options);
+          break;
+        default:
+          error(`Unknown subcommand: label ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman label list|get|add|remove`);
+          process.exit(1);
+      }
       break;
 
-    case "labels":
-      await cmdLabels(options);
-      break;
-
-    case "get-labels":
-      await cmdGetLabels(options);
-      break;
-
-    case "add-label":
-      await cmdAddLabel(options);
-      break;
-
-    case "remove-label":
-      await cmdRemoveLabel(options);
-      break;
-
+    // star add|remove|list
     case "star":
-      await cmdStar(options);
+      switch (options.subcommand) {
+        case "add":
+          await cmdStar(options);
+          break;
+        case "remove":
+          await cmdUnstar(options);
+          break;
+        case "list":
+          await cmdStarred(options);
+          break;
+        default:
+          error(`Unknown subcommand: star ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman star add|remove|list`);
+          process.exit(1);
+      }
       break;
 
-    case "unstar":
-      await cmdUnstar(options);
-      break;
-
-    case "starred":
-      await cmdStarred(options);
-      break;
-
+    // snooze set|cancel|list
     case "snooze":
-      await cmdSnooze(options);
+      switch (options.subcommand) {
+        case "set":
+          await cmdSnooze(options);
+          break;
+        case "cancel":
+          await cmdUnsnooze(options);
+          break;
+        case "list":
+          await cmdSnoozed(options);
+          break;
+        default:
+          error(`Unknown subcommand: snooze ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman snooze set|cancel|list`);
+          process.exit(1);
+      }
       break;
 
-    case "unsnooze":
-      await cmdUnsnooze(options);
+    // attachment list|download
+    case "attachment":
+      switch (options.subcommand) {
+        case "list":
+          await cmdAttachments(options);
+          break;
+        case "download":
+          await cmdDownload(options);
+          break;
+        default:
+          error(`Unknown subcommand: attachment ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman attachment list|download`);
+          process.exit(1);
+      }
       break;
 
-    case "snoozed":
-      await cmdSnoozed(options);
-      break;
-
-    case "attachments":
-      await cmdAttachments(options);
-      break;
-
-    case "download":
-      await cmdDownload(options);
-      break;
-
+    // calendar list|create|update|delete|free
     case "calendar":
-      await cmdCalendar(options);
+      switch (options.subcommand) {
+        case "list":
+        case "":
+          await cmdCalendar(options);
+          break;
+        case "create":
+          await cmdCalendarCreate(options);
+          break;
+        case "update":
+          await cmdCalendarUpdate(options);
+          break;
+        case "delete":
+          await cmdCalendarDelete(options);
+          break;
+        case "free":
+          await cmdCalendarFree(options);
+          break;
+        default:
+          error(`Unknown subcommand: calendar ${options.subcommand}`);
+          log(`Usage: superhuman calendar list|create|update|delete|free`);
+          process.exit(1);
+      }
       break;
 
-    case "calendar-create":
-      await cmdCalendarCreate(options);
-      break;
-
-    case "calendar-update":
-      await cmdCalendarUpdate(options);
-      break;
-
-    case "calendar-delete":
-      await cmdCalendarDelete(options);
-      break;
-
-    case "calendar-free":
-      await cmdCalendarFree(options);
-      break;
-
-    case "contacts":
-      await cmdContacts(options);
+    // contact search
+    case "contact":
+      switch (options.subcommand) {
+        case "search":
+          await cmdContacts(options);
+          break;
+        default:
+          error(`Unknown subcommand: contact ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman contact search <query>`);
+          process.exit(1);
+      }
       break;
 
     case "ai":
       await cmdAi(options);
       break;
 
-    case "compose":
-      await cmdCompose(options, true);
-      log(`\n${colors.dim}Compose window left open for editing${colors.reset}`);
+    // snippet list|use
+    case "snippet":
+      switch (options.subcommand) {
+        case "list":
+          await cmdSnippets(options);
+          break;
+        case "use":
+          await cmdSnippet(options);
+          break;
+        default:
+          error(`Unknown subcommand: snippet ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman snippet list|use`);
+          process.exit(1);
+      }
       break;
 
+
+    // draft create|update|delete|send
     case "draft":
-      await cmdDraft(options);
-      break;
-
-    case "delete-draft":
-      await cmdDeleteDraft(options);
-      break;
-
-    case "send-draft":
-      await cmdSendDraft(options);
+      switch (options.subcommand) {
+        case "create":
+          await cmdDraft(options);
+          break;
+        case "update":
+          await cmdDraft(options);
+          break;
+        case "delete":
+          await cmdDeleteDraft(options);
+          break;
+        case "send":
+          await cmdSendDraft(options);
+          break;
+        default:
+          error(`Unknown subcommand: draft ${options.subcommand || "(none)"}`);
+          log(`Usage: superhuman draft create|update|delete|send`);
+          process.exit(1);
+      }
       break;
 
     case "send":

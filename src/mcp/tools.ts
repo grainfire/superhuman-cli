@@ -7,26 +7,19 @@
 import { z } from "zod";
 import {
   connectToSuperhuman,
-  openCompose,
-  addRecipient,
-  setSubject,
-  setBody,
-  saveDraft,
-  sendDraft,
   disconnect,
-  getDraftState,
   textToHtml,
   type SuperhumanConnection,
 } from "../superhuman-api";
-import { listInbox, searchInbox } from "../inbox";
+import { listInbox, searchInbox, type SearchOptions } from "../inbox";
 import { readThread } from "../read";
 import { listAccounts, switchAccount } from "../accounts";
 import { replyToThread, replyAllToThread, forwardThread } from "../reply";
 import { archiveThread, deleteThread } from "../archive";
 import { markAsRead, markAsUnread } from "../read-status";
 import { listLabels, getThreadLabels, addLabel, removeLabel, starThread, unstarThread, listStarred } from "../labels";
-import { snoozeThread, unsnoozeThread, listSnoozed, parseSnoozeTime } from "../snooze";
-import { listAttachments, downloadAttachment, addAttachment } from "../attachments";
+import { parseSnoozeTime, snoozeThreadViaProvider, unsnoozeThreadViaProvider, listSnoozedViaProvider } from "../snooze";
+import { listAttachments, downloadAttachment } from "../attachments";
 import {
   listEvents,
   createEvent,
@@ -36,6 +29,10 @@ import {
   type CreateEventInput,
   type UpdateEventInput,
 } from "../calendar";
+import { listSnippets, findSnippet, applyVars, parseVars } from "../snippets";
+import { getUserInfo, getUserInfoFromCache, createDraftWithUserInfo, sendDraftSuperhuman } from "../draft-api";
+import { sendEmailViaProvider, createDraftViaProvider } from "../send-api";
+import { CDPConnectionProvider, resolveProvider, type ConnectionProvider } from "../connection-provider";
 
 const CDP_PORT = 9333;
 
@@ -232,15 +229,6 @@ export const DownloadAttachmentSchema = z.object({
 });
 
 /**
- * Zod schema for adding an attachment to current draft
- */
-export const AddAttachmentSchema = z.object({
-  filename: z.string().describe("The filename for the attachment"),
-  data: z.string().describe("The file content as a base64-encoded string"),
-  mimeType: z.string().describe("The MIME type of the file (e.g., 'application/pdf', 'image/png')"),
-});
-
-/**
  * Zod schema for listing calendar events
  */
 export const CalendarListSchema = z.object({
@@ -301,50 +289,50 @@ function errorResult(message: string): ToolResult {
 }
 
 /**
- * Compose an email (shared logic for draft and send)
+ * Get a ConnectionProvider for MCP tools.
+ * Prefers cached tokens; falls back to CDP.
  */
-async function composeEmail(
-  args: z.infer<typeof EmailSchema>
-): Promise<{ conn: SuperhumanConnection; draftKey: string }> {
+async function getMcpProvider(): Promise<ConnectionProvider> {
+  const provider = await resolveProvider({ port: CDP_PORT });
+  if (provider) return provider;
+
   const conn = await connectToSuperhuman(CDP_PORT);
   if (!conn) {
     throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
   }
-
-  const draftKey = await openCompose(conn);
-  if (!draftKey) {
-    await disconnect(conn);
-    throw new Error("Failed to open compose window");
-  }
-
-  await addRecipient(conn, args.to);
-  if (args.subject) await setSubject(conn, args.subject);
-  if (args.body) await setBody(conn, textToHtml(args.body));
-
-  return { conn, draftKey };
+  return new CDPConnectionProvider(conn);
 }
 
 /**
  * Handler for superhuman_draft tool
  */
 export async function draftHandler(args: z.infer<typeof DraftSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    const composed = await composeEmail(args);
-    conn = composed.conn;
+    provider = await getMcpProvider();
 
-    await saveDraft(conn);
-    const state = await getDraftState(conn);
+    const bodyHtml = textToHtml(args.body);
+    const result = await createDraftViaProvider(provider, {
+      to: [args.to],
+      cc: args.cc ? [args.cc] : undefined,
+      bcc: args.bcc ? [args.bcc] : undefined,
+      subject: args.subject,
+      body: bodyHtml,
+    });
 
-    return successResult(
-      `Draft created successfully.\nTo: ${args.to}\nSubject: ${args.subject}\nDraft ID: ${state?.id || composed.draftKey}`
-    );
+    if (result.success) {
+      return successResult(
+        `Draft created successfully.\nTo: ${args.to}\nSubject: ${args.subject}\nDraft ID: ${result.draftId || "(unknown)"}`
+      );
+    } else {
+      return errorResult(`Failed to create draft: ${result.error}`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to create draft: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -352,23 +340,31 @@ export async function draftHandler(args: z.infer<typeof DraftSchema>): Promise<T
  * Handler for superhuman_send tool
  */
 export async function sendHandler(args: z.infer<typeof SendSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    const composed = await composeEmail(args);
-    conn = composed.conn;
+    provider = await getMcpProvider();
 
-    const sent = await sendDraft(conn);
-    if (!sent) {
-      throw new Error("Failed to send email");
+    const bodyHtml = textToHtml(args.body);
+    const result = await sendEmailViaProvider(provider, {
+      to: [args.to],
+      cc: args.cc ? [args.cc] : undefined,
+      bcc: args.bcc ? [args.bcc] : undefined,
+      subject: args.subject,
+      body: bodyHtml,
+      isHtml: true,
+    });
+
+    if (result.success) {
+      return successResult(`Email sent successfully.\nTo: ${args.to}\nSubject: ${args.subject}`);
+    } else {
+      return errorResult(`Failed to send email: ${result.error}`);
     }
-
-    return successResult(`Email sent successfully.\nTo: ${args.to}\nSubject: ${args.subject}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to send email: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -376,89 +372,31 @@ export async function sendHandler(args: z.infer<typeof SendSchema>): Promise<Too
  * Handler for superhuman_search tool
  */
 export async function searchHandler(args: z.infer<typeof SearchSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const { Runtime } = conn;
+    provider = await getMcpProvider();
     const limit = args.limit ?? 10;
 
-    const searchResult = await Runtime.evaluate({
-      expression: `
-        (async () => {
-          try {
-            const portal = window.GoogleAccount?.portal;
-            if (!portal) return { error: 'Superhuman portal not found' };
+    const threads = await searchInbox(provider, { query: args.query, limit });
 
-            const listResult = await portal.invoke("threadInternal", "listAsync", [
-              "INBOX",
-              { limit: ${limit}, filters: [], query: ${JSON.stringify(args.query)} }
-            ]);
-
-            const threads = listResult?.threads || [];
-            return {
-              results: threads.slice(0, ${limit}).map(t => {
-                const json = t.json || {};
-                const shData = t.superhumanData || {};
-
-                let firstMessage = null;
-                if (shData.messages && typeof shData.messages === 'object') {
-                  const msgKeys = Object.keys(shData.messages);
-                  if (msgKeys.length > 0) {
-                    const msg = shData.messages[msgKeys[0]];
-                    firstMessage = msg.draft || msg;
-                  }
-                } else if (json.messages && json.messages.length > 0) {
-                  firstMessage = json.messages[0];
-                }
-
-                return {
-                  id: json.id || '',
-                  from: firstMessage?.from?.email || '',
-                  subject: firstMessage?.subject || json.snippet || '',
-                  snippet: firstMessage?.snippet || json.snippet || '',
-                  date: firstMessage?.date || firstMessage?.clientCreatedAt || ''
-                };
-              })
-            };
-          } catch (err) {
-            return { error: err.message };
-          }
-        })()
-      `,
-      returnByValue: true,
-      awaitPromise: true,
-    });
-
-    const result = searchResult.result.value as {
-      results?: Array<{ id: string; from: string; subject: string; snippet: string; date: string }>;
-      error?: string;
-    };
-
-    if (result.error) {
-      throw new Error(result.error);
-    }
-
-    const results = result.results || [];
-
-    if (results.length === 0) {
+    if (threads.length === 0) {
       return successResult(`No results found for query: "${args.query}"`);
     }
 
-    const resultsText = results
-      .map((r, i) => `${i + 1}. From: ${r.from}\n   Subject: ${r.subject}\n   Date: ${r.date}\n   Snippet: ${r.snippet}`)
+    const resultsText = threads
+      .map((t, i) => {
+        const from = t.from.name || t.from.email;
+        return `${i + 1}. From: ${from}\n   Subject: ${t.subject}\n   Date: ${t.date}\n   Snippet: ${t.snippet.substring(0, 100)}...`;
+      })
       .join("\n\n");
 
-    return successResult(`Found ${results.length} result(s) for query: "${args.query}"\n\n${resultsText}`);
+    return successResult(`Found ${threads.length} result(s) for query: "${args.query}"\n\n${resultsText}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to search inbox: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -466,15 +404,11 @@ export async function searchHandler(args: z.infer<typeof SearchSchema>): Promise
  * Handler for superhuman_inbox tool
  */
 export async function inboxHandler(args: z.infer<typeof InboxSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const threads = await listInbox(conn, { limit: args.limit ?? 10 });
+    provider = await getMcpProvider();
+    const threads = await listInbox(provider, { limit: args.limit ?? 10 });
 
     if (threads.length === 0) {
       return successResult("No emails in inbox");
@@ -492,7 +426,7 @@ export async function inboxHandler(args: z.infer<typeof InboxSchema>): Promise<T
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to list inbox: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -500,15 +434,11 @@ export async function inboxHandler(args: z.infer<typeof InboxSchema>): Promise<T
  * Handler for superhuman_read tool
  */
 export async function readHandler(args: z.infer<typeof ReadSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const messages = await readThread(conn, args.threadId);
+    provider = await getMcpProvider();
+    const messages = await readThread(provider, args.threadId);
 
     if (messages.length === 0) {
       return errorResult(`Thread not found: ${args.threadId}`);
@@ -528,7 +458,7 @@ export async function readHandler(args: z.infer<typeof ReadSchema>): Promise<Too
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to read thread: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -626,16 +556,12 @@ export async function switchAccountHandler(args: z.infer<typeof SwitchAccountSch
  * Handler for superhuman_reply tool
  */
 export async function replyHandler(args: z.infer<typeof ReplySchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const send = args.send ?? false;
-    const result = await replyToThread(conn, args.threadId, args.body, send);
+    const result = await replyToThread(provider, args.threadId, args.body, send);
 
     if (!result.success) {
       throw new Error(result.error || "Failed to create reply");
@@ -650,7 +576,7 @@ export async function replyHandler(args: z.infer<typeof ReplySchema>): Promise<T
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to reply: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -658,16 +584,12 @@ export async function replyHandler(args: z.infer<typeof ReplySchema>): Promise<T
  * Handler for superhuman_reply_all tool
  */
 export async function replyAllHandler(args: z.infer<typeof ReplyAllSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const send = args.send ?? false;
-    const result = await replyAllToThread(conn, args.threadId, args.body, send);
+    const result = await replyAllToThread(provider, args.threadId, args.body, send);
 
     if (!result.success) {
       throw new Error(result.error || "Failed to create reply-all");
@@ -682,7 +604,7 @@ export async function replyAllHandler(args: z.infer<typeof ReplyAllSchema>): Pro
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to reply-all: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -690,16 +612,12 @@ export async function replyAllHandler(args: z.infer<typeof ReplyAllSchema>): Pro
  * Handler for superhuman_forward tool
  */
 export async function forwardHandler(args: z.infer<typeof ForwardSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const send = args.send ?? false;
-    const result = await forwardThread(conn, args.threadId, args.toEmail, args.body, send);
+    const result = await forwardThread(provider, args.threadId, args.toEmail, args.body, send);
 
     if (!result.success) {
       throw new Error(result.error || "Failed to create forward");
@@ -714,7 +632,7 @@ export async function forwardHandler(args: z.infer<typeof ForwardSchema>): Promi
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to forward: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -726,18 +644,14 @@ export async function archiveHandler(args: z.infer<typeof ArchiveSchema>): Promi
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await archiveThread(conn, threadId);
+      const result = await archiveThread(provider, threadId);
       results.push({ threadId, success: result.success });
     }
 
@@ -756,7 +670,7 @@ export async function archiveHandler(args: z.infer<typeof ArchiveSchema>): Promi
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to archive: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -768,18 +682,14 @@ export async function deleteHandler(args: z.infer<typeof DeleteSchema>): Promise
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await deleteThread(conn, threadId);
+      const result = await deleteThread(provider, threadId);
       results.push({ threadId, success: result.success });
     }
 
@@ -798,7 +708,7 @@ export async function deleteHandler(args: z.infer<typeof DeleteSchema>): Promise
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to delete: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -810,18 +720,14 @@ export async function markReadHandler(args: z.infer<typeof MarkReadSchema>): Pro
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await markAsRead(conn, threadId);
+      const result = await markAsRead(provider, threadId);
       results.push({ threadId, success: result.success });
     }
 
@@ -840,7 +746,7 @@ export async function markReadHandler(args: z.infer<typeof MarkReadSchema>): Pro
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to mark as read: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -852,18 +758,14 @@ export async function markUnreadHandler(args: z.infer<typeof MarkUnreadSchema>):
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await markAsUnread(conn, threadId);
+      const result = await markAsUnread(provider, threadId);
       results.push({ threadId, success: result.success });
     }
 
@@ -882,7 +784,7 @@ export async function markUnreadHandler(args: z.infer<typeof MarkUnreadSchema>):
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to mark as unread: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -890,15 +792,11 @@ export async function markUnreadHandler(args: z.infer<typeof MarkUnreadSchema>):
  * Handler for superhuman_labels tool
  */
 export async function labelsHandler(_args: z.infer<typeof LabelsSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const labels = await listLabels(conn);
+    provider = await getMcpProvider();
+    const labels = await listLabels(provider);
 
     if (labels.length === 0) {
       return successResult("No labels found");
@@ -916,7 +814,7 @@ export async function labelsHandler(_args: z.infer<typeof LabelsSchema>): Promis
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to list labels: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -924,15 +822,11 @@ export async function labelsHandler(_args: z.infer<typeof LabelsSchema>): Promis
  * Handler for superhuman_get_labels tool
  */
 export async function getLabelsHandler(args: z.infer<typeof GetLabelsSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const labels = await getThreadLabels(conn, args.threadId);
+    provider = await getMcpProvider();
+    const labels = await getThreadLabels(provider, args.threadId);
 
     if (labels.length === 0) {
       return successResult(`No labels on thread ${args.threadId}`);
@@ -950,7 +844,7 @@ export async function getLabelsHandler(args: z.infer<typeof GetLabelsSchema>): P
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to get thread labels: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -962,18 +856,14 @@ export async function addLabelHandler(args: z.infer<typeof AddLabelSchema>): Pro
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await addLabel(conn, threadId, args.labelId);
+      const result = await addLabel(provider, threadId, args.labelId);
       results.push({ threadId, success: result.success });
     }
 
@@ -992,7 +882,7 @@ export async function addLabelHandler(args: z.infer<typeof AddLabelSchema>): Pro
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to add label: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1004,18 +894,14 @@ export async function removeLabelHandler(args: z.infer<typeof RemoveLabelSchema>
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await removeLabel(conn, threadId, args.labelId);
+      const result = await removeLabel(provider, threadId, args.labelId);
       results.push({ threadId, success: result.success });
     }
 
@@ -1034,7 +920,7 @@ export async function removeLabelHandler(args: z.infer<typeof RemoveLabelSchema>
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to remove label: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1046,18 +932,14 @@ export async function starHandler(args: z.infer<typeof StarSchema>): Promise<Too
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean; error?: string }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await starThread(conn, threadId);
+      const result = await starThread(provider, threadId);
       results.push({ threadId, success: result.success, error: result.error });
     }
 
@@ -1076,7 +958,7 @@ export async function starHandler(args: z.infer<typeof StarSchema>): Promise<Too
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to star: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1088,18 +970,14 @@ export async function unstarHandler(args: z.infer<typeof UnstarSchema>): Promise
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const results: { threadId: string; success: boolean; error?: string }[] = [];
 
     for (const threadId of args.threadIds) {
-      const result = await unstarThread(conn, threadId);
+      const result = await unstarThread(provider, threadId);
       results.push({ threadId, success: result.success, error: result.error });
     }
 
@@ -1118,7 +996,7 @@ export async function unstarHandler(args: z.infer<typeof UnstarSchema>): Promise
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to unstar: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1126,16 +1004,12 @@ export async function unstarHandler(args: z.infer<typeof UnstarSchema>): Promise
  * Handler for superhuman_starred tool
  */
 export async function starredHandler(args: z.infer<typeof StarredSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
+    provider = await getMcpProvider();
     const limit = args.limit ?? 50;
-    const threads = await listStarred(conn, limit);
+    const threads = await listStarred(provider, limit);
 
     if (threads.length === 0) {
       return successResult("No starred threads found");
@@ -1150,7 +1024,7 @@ export async function starredHandler(args: z.infer<typeof StarredSchema>): Promi
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to list starred threads: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1169,20 +1043,12 @@ export async function snoozeHandler(args: z.infer<typeof SnoozeSchema>): Promise
     return errorResult(`Invalid snooze time: ${args.until}`);
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
+    provider = await getMcpProvider();
 
-    const results: { threadId: string; success: boolean; error?: string }[] = [];
-
-    for (const threadId of args.threadIds) {
-      const result = await snoozeThread(conn, threadId, snoozeTime);
-      results.push({ threadId, success: result.success, error: result.error });
-    }
+    const results = await snoozeThreadViaProvider(provider, args.threadIds, snoozeTime);
 
     const succeeded = results.filter((r) => r.success).length;
     const failed = results.filter((r) => !r.success).length;
@@ -1192,14 +1058,14 @@ export async function snoozeHandler(args: z.infer<typeof SnoozeSchema>): Promise
     } else if (succeeded === 0) {
       return errorResult(`Failed to snooze all ${failed} thread(s)`);
     } else {
-      const failedIds = results.filter((r) => !r.success).map((r) => r.threadId).join(", ");
-      return successResult(`Snoozed ${succeeded} thread(s), failed on ${failed}: ${failedIds}`);
+      const failedThreads = args.threadIds.filter((_, i) => !results[i].success).join(", ");
+      return successResult(`Snoozed ${succeeded} thread(s), failed on ${failed}: ${failedThreads}`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to snooze: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1211,20 +1077,12 @@ export async function unsnoozeHandler(args: z.infer<typeof UnsnoozeSchema>): Pro
     return errorResult("At least one thread ID is required");
   }
 
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
+    provider = await getMcpProvider();
 
-    const results: { threadId: string; success: boolean; error?: string }[] = [];
-
-    for (const threadId of args.threadIds) {
-      const result = await unsnoozeThread(conn, threadId);
-      results.push({ threadId, success: result.success, error: result.error });
-    }
+    const results = await unsnoozeThreadViaProvider(provider, args.threadIds);
 
     const succeeded = results.filter((r) => r.success).length;
     const failed = results.filter((r) => !r.success).length;
@@ -1234,14 +1092,14 @@ export async function unsnoozeHandler(args: z.infer<typeof UnsnoozeSchema>): Pro
     } else if (succeeded === 0) {
       return errorResult(`Failed to unsnooze all ${failed} thread(s)`);
     } else {
-      const failedIds = results.filter((r) => !r.success).map((r) => r.threadId).join(", ");
-      return successResult(`Unsnoozed ${succeeded} thread(s), failed on ${failed}: ${failedIds}`);
+      const failedThreads = args.threadIds.filter((_, i) => !results[i].success).join(", ");
+      return successResult(`Unsnoozed ${succeeded} thread(s), failed on ${failed}: ${failedThreads}`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to unsnooze: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1249,16 +1107,13 @@ export async function unsnoozeHandler(args: z.infer<typeof UnsnoozeSchema>): Pro
  * Handler for superhuman_snoozed tool
  */
 export async function snoozedHandler(args: z.infer<typeof SnoozedSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
+    provider = await getMcpProvider();
 
     const limit = args.limit ?? 50;
-    const threads = await listSnoozed(conn, limit);
+    const threads = await listSnoozedViaProvider(provider, limit);
 
     if (threads.length === 0) {
       return successResult("No snoozed threads found");
@@ -1276,7 +1131,7 @@ export async function snoozedHandler(args: z.infer<typeof SnoozedSchema>): Promi
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to list snoozed threads: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1284,15 +1139,11 @@ export async function snoozedHandler(args: z.infer<typeof SnoozedSchema>): Promi
  * Handler for superhuman_attachments tool
  */
 export async function attachmentsHandler(args: z.infer<typeof AttachmentsSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const attachments = await listAttachments(conn, args.threadId);
+    provider = await getMcpProvider();
+    const attachments = await listAttachments(provider, args.threadId);
 
     if (attachments.length === 0) {
       return successResult(`No attachments found in thread ${args.threadId}`);
@@ -1309,7 +1160,7 @@ export async function attachmentsHandler(args: z.infer<typeof AttachmentsSchema>
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to list attachments: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1317,15 +1168,11 @@ export async function attachmentsHandler(args: z.infer<typeof AttachmentsSchema>
  * Handler for superhuman_download_attachment tool
  */
 export async function downloadAttachmentHandler(args: z.infer<typeof DownloadAttachmentSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const content = await downloadAttachment(conn, args.messageId, args.attachmentId, args.threadId, args.mimeType);
+    provider = await getMcpProvider();
+    const content = await downloadAttachment(provider, args.messageId, args.attachmentId, args.threadId, args.mimeType);
 
     return successResult(JSON.stringify({
       data: content.data,
@@ -1336,48 +1183,19 @@ export async function downloadAttachmentHandler(args: z.infer<typeof DownloadAtt
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to download attachment: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
-/**
- * Handler for superhuman_add_attachment tool
- */
-export async function addAttachmentHandler(args: z.infer<typeof AddAttachmentSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
-
-  try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const result = await addAttachment(conn, args.filename, args.data, args.mimeType);
-
-    if (result.success) {
-      return successResult(`Attachment "${args.filename}" added to draft successfully`);
-    } else {
-      return errorResult(`Failed to add attachment: ${result.error || "Unknown error"}`);
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return errorResult(`Failed to add attachment: ${message}`);
-  } finally {
-    if (conn) await disconnect(conn);
-  }
-}
 
 /**
  * Handler for superhuman_calendar_list tool
  */
 export async function calendarListHandler(args: z.infer<typeof CalendarListSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
+    provider = await getMcpProvider();
 
     // Parse date
     let timeMin: Date;
@@ -1403,14 +1221,14 @@ export async function calendarListHandler(args: z.infer<typeof CalendarListSchem
     timeMax.setDate(timeMax.getDate() + range);
     timeMax.setHours(23, 59, 59, 999);
 
-    const events = await listEvents(conn, { timeMin, timeMax });
+    const events = await listEvents(provider, { timeMin, timeMax });
 
     return successResult(JSON.stringify(events, null, 2));
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to list calendar events: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1418,13 +1236,10 @@ export async function calendarListHandler(args: z.infer<typeof CalendarListSchem
  * Handler for superhuman_calendar_create tool
  */
 export async function calendarCreateHandler(args: z.infer<typeof CalendarCreateSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
+    provider = await getMcpProvider();
 
     const startTime = new Date(args.startTime);
     let endTime: Date;
@@ -1447,7 +1262,7 @@ export async function calendarCreateHandler(args: z.infer<typeof CalendarCreateS
       location: args.location,
     };
 
-    const result = await createEvent(conn, eventInput);
+    const result = await createEvent(provider, eventInput);
 
     if (result.success) {
       return successResult(JSON.stringify({
@@ -1462,7 +1277,7 @@ export async function calendarCreateHandler(args: z.infer<typeof CalendarCreateS
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to create calendar event: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1470,13 +1285,10 @@ export async function calendarCreateHandler(args: z.infer<typeof CalendarCreateS
  * Handler for superhuman_calendar_update tool
  */
 export async function calendarUpdateHandler(args: z.infer<typeof CalendarUpdateSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
+    provider = await getMcpProvider();
 
     const updates: UpdateEventInput = {};
     if (args.title) updates.summary = args.title;
@@ -1486,7 +1298,7 @@ export async function calendarUpdateHandler(args: z.infer<typeof CalendarUpdateS
     if (args.attendees) updates.attendees = args.attendees.map(email => ({ email }));
     if (args.location) updates.location = args.location;
 
-    const result = await updateEvent(conn, args.eventId, updates);
+    const result = await updateEvent(provider, args.eventId, updates);
 
     if (result.success) {
       return successResult(JSON.stringify({
@@ -1501,7 +1313,7 @@ export async function calendarUpdateHandler(args: z.infer<typeof CalendarUpdateS
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to update calendar event: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1509,15 +1321,11 @@ export async function calendarUpdateHandler(args: z.infer<typeof CalendarUpdateS
  * Handler for superhuman_calendar_delete tool
  */
 export async function calendarDeleteHandler(args: z.infer<typeof CalendarDeleteSchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const result = await deleteCalendarEvent(conn, args.eventId);
+    provider = await getMcpProvider();
+    const result = await deleteCalendarEvent(provider, args.eventId);
 
     if (result.success) {
       return successResult(JSON.stringify({
@@ -1531,7 +1339,7 @@ export async function calendarDeleteHandler(args: z.infer<typeof CalendarDeleteS
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to delete calendar event: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
   }
 }
 
@@ -1539,15 +1347,11 @@ export async function calendarDeleteHandler(args: z.infer<typeof CalendarDeleteS
  * Handler for superhuman_calendar_free_busy tool
  */
 export async function calendarFreeBusyHandler(args: z.infer<typeof CalendarFreeBusySchema>): Promise<ToolResult> {
-  let conn: SuperhumanConnection | null = null;
+  let provider: ConnectionProvider | null = null;
 
   try {
-    conn = await connectToSuperhuman(CDP_PORT);
-    if (!conn) {
-      throw new Error("Could not connect to Superhuman. Make sure it's running with --remote-debugging-port=9333");
-    }
-
-    const result = await getFreeBusy(conn, {
+    provider = await getMcpProvider();
+    const result = await getFreeBusy(provider, {
       timeMin: new Date(args.timeMin),
       timeMax: new Date(args.timeMax),
     });
@@ -1557,6 +1361,147 @@ export async function calendarFreeBusyHandler(args: z.infer<typeof CalendarFreeB
     const message = error instanceof Error ? error.message : "Unknown error";
     return errorResult(`Failed to check free/busy: ${message}`);
   } finally {
-    if (conn) await disconnect(conn);
+    if (provider) await provider.disconnect();
+  }
+}
+
+// =============================================================================
+// Snippets Tools
+// =============================================================================
+
+export const SnippetsSchema = z.object({});
+
+export const UseSnippetSchema = z.object({
+  name: z.string().describe("Snippet name to search for (fuzzy match)"),
+  to: z.string().optional().describe("Recipient email address (overrides snippet default)"),
+  cc: z.string().optional().describe("CC recipient email (overrides snippet default)"),
+  bcc: z.string().optional().describe("BCC recipient email (overrides snippet default)"),
+  vars: z.string().optional().describe("Template variables as 'key1=val1,key2=val2'"),
+  send: z.boolean().optional().describe("Send immediately instead of creating draft (default: false)"),
+});
+
+/**
+ * Get UserInfo from a ConnectionProvider (prefers cached tokens, falls back to CDP).
+ */
+async function getUserInfoFromProvider(provider: ConnectionProvider): Promise<import("../draft-api").UserInfo> {
+  const token = await provider.getToken();
+  if (token.userId && token.idToken) {
+    return getUserInfoFromCache(token.userId, token.email, token.idToken);
+  }
+  // Fallback: if token lacks userId/idToken, try CDP
+  const conn = await connectToSuperhuman(CDP_PORT);
+  if (!conn) {
+    throw new Error("Cached token missing userId/idToken. Run 'superhuman account auth' to re-authenticate.");
+  }
+  try {
+    return await getUserInfo(conn);
+  } finally {
+    await disconnect(conn);
+  }
+}
+
+/**
+ * Handler for superhuman_snippets tool - list all snippets
+ */
+export async function snippetsHandler(_args: z.infer<typeof SnippetsSchema>): Promise<ToolResult> {
+  let provider: ConnectionProvider | null = null;
+
+  try {
+    provider = await getMcpProvider();
+    const userInfo = await getUserInfoFromProvider(provider);
+    const snippets = await listSnippets(userInfo);
+
+    if (snippets.length === 0) {
+      return successResult("No snippets found");
+    }
+
+    const snippetsList = snippets
+      .map((s) => {
+        const lastUsed = s.lastSentAt ? new Date(s.lastSentAt).toLocaleDateString() : "never";
+        return `- ${s.name}\n  Sends: ${s.sends} | Last used: ${lastUsed}\n  Subject: ${s.subject || "(none)"}\n  Preview: ${s.snippet || "(empty)"}`;
+      })
+      .join("\n\n");
+
+    return successResult(`Snippets (${snippets.length}):\n\n${snippetsList}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return errorResult(`Failed to list snippets: ${message}`);
+  } finally {
+    if (provider) await provider.disconnect();
+  }
+}
+
+/**
+ * Handler for superhuman_snippet tool - use a snippet to compose/send
+ */
+export async function useSnippetHandler(args: z.infer<typeof UseSnippetSchema>): Promise<ToolResult> {
+  let provider: ConnectionProvider | null = null;
+
+  try {
+    provider = await getMcpProvider();
+    const userInfo = await getUserInfoFromProvider(provider);
+    const snippets = await listSnippets(userInfo);
+    const snippet = findSnippet(snippets, args.name);
+
+    if (!snippet) {
+      const available = snippets.map((s) => s.name).join(", ");
+      return errorResult(`No snippet matching "${args.name}". Available: ${available}`);
+    }
+
+    // Apply template variables
+    const vars = args.vars ? parseVars(args.vars) : {};
+    let body = snippet.body;
+    let subject = snippet.subject;
+    if (Object.keys(vars).length > 0) {
+      body = applyVars(body, vars);
+      subject = applyVars(subject, vars);
+    }
+
+    // Merge recipients
+    const to = args.to ? [args.to] : snippet.to;
+    const cc = args.cc ? [args.cc] : snippet.cc.length > 0 ? snippet.cc : undefined;
+    const bcc = args.bcc ? [args.bcc] : snippet.bcc.length > 0 ? snippet.bcc : undefined;
+
+    if (args.send) {
+      if (to.length === 0) {
+        return errorResult("At least one recipient is required (provide 'to' or snippet must have default recipients)");
+      }
+
+      const draftResult = await createDraftWithUserInfo(userInfo, { to, cc, bcc, subject, body });
+      if (!draftResult.success || !draftResult.draftId || !draftResult.threadId) {
+        return errorResult(`Failed to create draft: ${draftResult.error}`);
+      }
+
+      const sendResult = await sendDraftSuperhuman(userInfo, {
+        draftId: draftResult.draftId,
+        threadId: draftResult.threadId,
+        to: to.map((email) => ({ email })),
+        cc: cc?.map((email) => ({ email })),
+        bcc: bcc?.map((email) => ({ email })),
+        subject,
+        htmlBody: body,
+        delay: 0,
+      });
+
+      if (sendResult.success) {
+        return successResult(`Sent using snippet "${snippet.name}" to ${to.join(", ")}`);
+      } else {
+        return errorResult(`Failed to send: ${sendResult.error}`);
+      }
+    } else {
+      const result = await createDraftWithUserInfo(userInfo, { to, cc, bcc, subject, body });
+      if (result.success) {
+        return successResult(
+          `Draft created from snippet "${snippet.name}"\nDraft ID: ${result.draftId}\nTo: ${to.join(", ")}\nSubject: ${subject || "(none)"}`
+        );
+      } else {
+        return errorResult(`Failed to create draft: ${result.error}`);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return errorResult(`Failed to use snippet: ${message}`);
+  } finally {
+    if (provider) await provider.disconnect();
   }
 }

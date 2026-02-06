@@ -15,6 +15,8 @@ export interface TokenInfo {
   email: string;
   expires: number;
   isMicrosoft: boolean;
+  // OAuth refresh token for background refresh
+  refreshToken?: string;
   // Superhuman backend API fields
   userId?: string;
   idToken?: string;
@@ -70,6 +72,8 @@ export async function extractToken(
             email: ga?.emailAddress || '',
             expires: authData.expires || (Date.now() + 3600000),
             isMicrosoft: !!di?.get?.('isMicrosoft'),
+            // OAuth refresh token for background refresh
+            refreshToken: authData.refreshToken,
             // Superhuman backend API fields
             userId: user?._id,
             idToken: authData.idToken,
@@ -148,6 +152,57 @@ export function setTokenCacheForTest(email: string, token: TokenInfo): void {
   tokenCache.set(email, token);
 }
 
+/**
+ * Refresh OAuth access token using refresh token.
+ *
+ * Calls the appropriate OAuth endpoint (Google or Microsoft) to exchange
+ * the refresh token for a new access token.
+ *
+ * @param token - Token info with refresh token
+ * @returns Updated TokenInfo with new access token, or null on failure
+ */
+export async function refreshAccessToken(
+  token: TokenInfo
+): Promise<TokenInfo | null> {
+  if (!token.refreshToken) {
+    return null;
+  }
+
+  const endpoint = token.isMicrosoft
+    ? "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    : "https://oauth2.googleapis.com/token";
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: token.refreshToken,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error(`Token refresh failed: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+
+    return {
+      ...token,
+      accessToken: data.access_token,
+      expires: Date.now() + data.expires_in * 1000,
+      refreshToken: data.refresh_token || token.refreshToken,
+    };
+  } catch (error) {
+    console.error("Token refresh error:", error);
+    return null;
+  }
+}
+
 // ============================================================================
 // Token Persistence
 // ============================================================================
@@ -163,6 +218,7 @@ export interface PersistedTokens {
       accessToken: string;
       expires: number; // Unix timestamp
       userId?: string; // Superhuman user ID for API paths
+      refreshToken?: string; // OAuth refresh token for background refresh
       superhumanToken?: {
         token: string; // idToken for Superhuman backend
         expires?: number;
@@ -210,6 +266,7 @@ export async function saveTokensToDisk(): Promise<void> {
       accessToken: token.accessToken,
       expires: token.expires,
       userId: token.userId,
+      refreshToken: token.refreshToken,
       superhumanToken: token.idToken ? {
         token: token.idToken,
         expires: token.idTokenExpires,
@@ -251,6 +308,7 @@ export async function loadTokensFromDisk(): Promise<boolean> {
         expires: account.expires,
         isMicrosoft: account.type === "microsoft",
         userId: account.userId,
+        refreshToken: account.refreshToken,
         idToken: account.superhumanToken?.token,
         idTokenExpires: account.superhumanToken?.expires,
       });
@@ -285,15 +343,33 @@ export function hasValidCachedTokens(): boolean {
 
 /**
  * Get cached token for a specific account.
- * Returns undefined if not found or expired.
+ *
+ * If the token is expired or expiring within 5 minutes:
+ * - Attempts to refresh using the refresh token
+ * - Persists the refreshed token to disk
+ * - Returns undefined if refresh fails
+ *
+ * @param email - Account email
+ * @returns Token info if valid/refreshed, undefined otherwise
  */
-export function getCachedToken(email: string): TokenInfo | undefined {
+export async function getCachedToken(email: string): Promise<TokenInfo | undefined> {
   const token = tokenCache.get(email);
   if (!token) return undefined;
 
   const bufferMs = 5 * 60 * 1000; // 5 minutes
   if (token.expires < Date.now() + bufferMs) {
-    return undefined; // Expired or expiring soon
+    // Token expired or expiring soon - try to refresh
+    if (token.refreshToken) {
+      const refreshed = await refreshAccessToken(token);
+      if (refreshed) {
+        tokenCache.set(email, refreshed);
+        await saveTokensToDisk();
+        return refreshed;
+      }
+    }
+    // Refresh failed or no refresh token
+    console.warn(`Token for ${email} expired. Run 'superhuman auth' to re-authenticate.`);
+    return undefined;
   }
 
   return token;
@@ -310,8 +386,8 @@ export function getCachedAccounts(): string[] {
  * Check if we have valid cached credentials for Superhuman API.
  * Requires both idToken and userId.
  */
-export function hasCachedSuperhumanCredentials(email: string): boolean {
-  const token = getCachedToken(email);
+export async function hasCachedSuperhumanCredentials(email: string): Promise<boolean> {
+  const token = await getCachedToken(email);
   return !!(token?.idToken && token?.userId);
 }
 
@@ -2521,6 +2597,138 @@ export async function sendReplyDirect(
 }
 
 /**
+ * Update an existing draft via direct Gmail/MS Graph API.
+ *
+ * @param token - Token info
+ * @param draftId - Draft ID to update
+ * @param options - Fields to update (only provided fields are changed)
+ * @returns Updated draft info or null on failure
+ */
+export async function updateDraftDirect(
+  token: TokenInfo,
+  draftId: string,
+  options: {
+    to?: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject?: string;
+    body?: string;
+    isHtml?: boolean;
+  }
+): Promise<{ draftId: string; messageId?: string } | null> {
+  if (token.isMicrosoft) {
+    // MS Graph: PATCH /me/messages/{id}
+    const updates: Record<string, unknown> = {};
+
+    if (options.subject !== undefined) {
+      updates.subject = options.subject;
+    }
+    if (options.body !== undefined) {
+      updates.body = {
+        contentType: (options.isHtml ?? true) ? "HTML" : "Text",
+        content: options.body,
+      };
+    }
+    if (options.to) {
+      updates.toRecipients = options.to.map((email) => ({
+        emailAddress: { address: email },
+      }));
+    }
+    if (options.cc) {
+      updates.ccRecipients = options.cc.map((email) => ({
+        emailAddress: { address: email },
+      }));
+    }
+    if (options.bcc) {
+      updates.bccRecipients = options.bcc.map((email) => ({
+        emailAddress: { address: email },
+      }));
+    }
+
+    const result = await msgraphFetch(token.accessToken, `/me/messages/${draftId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+
+    if (!result?.id) return null;
+    return { draftId: result.id, messageId: result.id };
+  } else {
+    // Gmail: GET existing draft, merge updates, PUT back
+    const existing = await gmailFetch(token.accessToken, `/drafts/${draftId}?format=full`);
+    if (!existing?.message) return null;
+
+    const existingHeaders = existing.message.payload?.headers || [];
+    const getHeader = (name: string) =>
+      existingHeaders.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || "";
+
+    const to = options.to || getHeader("To").split(",").map((s: string) => s.trim()).filter(Boolean);
+    const cc = options.cc || getHeader("Cc").split(",").map((s: string) => s.trim()).filter(Boolean);
+    const bcc = options.bcc || getHeader("Bcc").split(",").map((s: string) => s.trim()).filter(Boolean);
+    const subject = options.subject ?? getHeader("Subject");
+
+    // Extract existing body if not being replaced
+    let body = options.body;
+    let isHtml = options.isHtml ?? true;
+    if (body === undefined) {
+      const payload = existing.message.payload;
+      const extractBody = (part: any): string | undefined => {
+        if (part.mimeType === "text/html" && part.body?.data) {
+          isHtml = true;
+          return Buffer.from(part.body.data, "base64url").toString("utf-8");
+        }
+        if (part.mimeType === "text/plain" && part.body?.data) {
+          return Buffer.from(part.body.data, "base64url").toString("utf-8");
+        }
+        if (part.parts) {
+          for (const p of part.parts) {
+            const result = extractBody(p);
+            if (result) return result;
+          }
+        }
+        return undefined;
+      };
+      body = extractBody(payload) || "";
+    }
+
+    const mimeMessage = buildMimeMessage({
+      from: token.email,
+      to,
+      cc: cc.length > 0 ? cc : undefined,
+      bcc: bcc.length > 0 ? bcc : undefined,
+      subject,
+      body: body || "",
+      isHtml,
+      inReplyTo: getHeader("In-Reply-To") || undefined,
+      references: getHeader("References") ? getHeader("References").split(/\s+/).filter(Boolean) : undefined,
+    });
+
+    const payload: Record<string, unknown> = {
+      message: { raw: mimeMessage },
+    };
+    if (existing.message.threadId) {
+      (payload.message as Record<string, unknown>).threadId = existing.message.threadId;
+    }
+
+    const result = await fetch(
+      `https://www.googleapis.com/gmail/v1/users/me/drafts/${draftId}`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${token.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    if (!result.ok) return null;
+    const data = await result.json() as any;
+    return { draftId: data.id, messageId: data.message?.id };
+  }
+}
+
+/**
  * Delete a draft via direct API.
  *
  * @param token - Token info
@@ -2794,13 +3002,19 @@ export interface AIChatMessage {
 }
 
 /**
- * Thread message for AI context.
- * Note: The AI API only accepts these three fields - additional fields cause 400 errors.
+ * Full thread message with all metadata.
+ * Note: The AI API (ai.compose) only accepts message_id, subject, body —
+ * additional fields cause 400 errors, so callers must map accordingly.
  */
-export interface AIThreadMessage {
+export interface FullThreadMessage {
   message_id: string;
   subject: string;
   body: string;
+  from: { email: string; name: string };
+  to: Array<{ email: string; name: string }>;
+  cc: Array<{ email: string; name: string }>;
+  date: string;
+  snippet: string;
 }
 
 /**
@@ -2909,82 +3123,154 @@ export async function extractUserPrefix(
 }
 
 /**
- * Get thread messages for AI context.
- * Fetches the full thread content including body text.
+ * Parse an email address string like "Name <email>" or just "email".
+ */
+function parseEmailAddress(raw: string): { email: string; name: string } {
+  const match = raw.match(/^(.*?)\s*<([^>]+)>$/);
+  if (match) {
+    return { name: match[1].trim().replace(/^"|"$/g, ""), email: match[2] };
+  }
+  return { name: "", email: raw.trim() };
+}
+
+/**
+ * Parse a comma-separated list of email addresses from a header value.
+ */
+function parseRecipientList(header: string): Array<{ email: string; name: string }> {
+  if (!header) return [];
+  return header.split(",").map((r) => parseEmailAddress(r.trim())).filter((r) => r.email);
+}
+
+/**
+ * Map an MS Graph emailAddress object to { email, name }.
+ */
+function mapMsGraphContact(contact: any): { email: string; name: string } {
+  return {
+    email: contact?.emailAddress?.address || "",
+    name: contact?.emailAddress?.name || "",
+  };
+}
+
+/**
+ * Map an array of MS Graph recipient objects to { email, name }[].
+ */
+function mapMsGraphContacts(recipients: any[] | undefined): Array<{ email: string; name: string }> {
+  return (recipients || []).map(mapMsGraphContact);
+}
+
+/**
+ * Get full thread messages with all metadata.
+ * Fetches complete thread content including body text, headers, and recipients.
  *
  * @param token - OAuth token info
  * @param threadId - Thread ID to get messages from
- * @returns Array of thread messages with body text
+ * @returns Array of full thread messages
  */
-export async function getThreadMessagesForAI(
+export async function getThreadMessages(
   token: TokenInfo,
   threadId: string
-): Promise<AIThreadMessage[]> {
+): Promise<FullThreadMessage[]> {
   if (token.isMicrosoft) {
-    // MS Graph: Get messages in conversation
-    const path = `/me/messages?$filter=conversationId eq '${threadId}'&$select=id,subject,body,from,toRecipients,receivedDateTime&$orderby=receivedDateTime asc`;
-    const result = await msgraphFetch(token.accessToken, path);
+    return getThreadMessagesMsGraph(token, threadId);
+  }
+  return getThreadMessagesGmail(token, threadId);
+}
 
-    if (!result || !result.value) {
-      return [];
+async function getThreadMessagesMsGraph(
+  token: TokenInfo,
+  threadId: string
+): Promise<FullThreadMessage[]> {
+  // The $filter on conversationId at /me/messages level returns "InefficientFilter",
+  // so we fetch recent messages and filter client-side by conversationId.
+  const selectFields = "id,subject,body,conversationId,receivedDateTime,from,toRecipients,ccRecipients,bodyPreview";
+  const recentPath = `/me/messages?$select=${selectFields}&$top=50&$orderby=receivedDateTime desc`;
+  const recentResult = await msgraphFetch(token.accessToken, recentPath);
+
+  let messages: any[] = [];
+  if (recentResult?.value) {
+    messages = recentResult.value.filter((m: any) => m.conversationId === threadId);
+    // Sort oldest first for thread context
+    messages.sort((a: any, b: any) =>
+      new Date(a.receivedDateTime).getTime() - new Date(b.receivedDateTime).getTime()
+    );
+  }
+
+  // Fallback: if threadId is actually a message ID, fetch it directly
+  if (messages.length === 0) {
+    const fallbackFields = "id,subject,body,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview";
+    try {
+      const msg = await msgraphFetch(token.accessToken, `/me/messages/${threadId}?$select=${fallbackFields}`);
+      if (msg) {
+        messages = [msg];
+      }
+    } catch {
+      // Not a message ID either
     }
+  }
 
-    // Note: The AI API only accepts message_id, subject, and body fields
-    // Additional fields like from, to, date cause a 400 error
-    return result.value.map((msg: any) => ({
-      message_id: msg.id,
-      subject: msg.subject || "",
-      body: msg.body?.content || "",
-    }));
-  } else {
-    // Gmail: Get thread with full format to get body
-    const path = `/threads/${threadId}?format=full`;
-    const result = await gmailFetch(token.accessToken, path);
+  return messages.map((msg: any) => ({
+    message_id: msg.id,
+    subject: msg.subject || "",
+    body: msg.body?.content || "",
+    from: mapMsGraphContact(msg.from),
+    to: mapMsGraphContacts(msg.toRecipients),
+    cc: mapMsGraphContacts(msg.ccRecipients),
+    date: msg.receivedDateTime || "",
+    snippet: msg.bodyPreview || "",
+  }));
+}
 
-    if (!result || !result.messages) {
-      return [];
-    }
+async function getThreadMessagesGmail(
+  token: TokenInfo,
+  threadId: string
+): Promise<FullThreadMessage[]> {
+  const result = await gmailFetch(token.accessToken, `/threads/${threadId}?format=full`);
 
-    return result.messages.map((msg: any) => {
-      const headers = msg.payload?.headers || [];
-      const getHeader = (name: string): string => {
-        const h = headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase());
-        return h?.value || "";
-      };
+  if (!result || !result.messages) {
+    return [];
+  }
 
-      // Extract body from parts
-      let body = "";
-      function extractBody(part: any): void {
-        if (part.mimeType === "text/plain" && part.body?.data) {
-          body = Buffer.from(part.body.data, "base64url").toString("utf-8");
-        } else if (part.mimeType === "text/html" && part.body?.data && !body) {
-          // Strip HTML tags for AI context (prefer plain text)
-          const htmlBody = Buffer.from(part.body.data, "base64url").toString("utf-8");
-          body = htmlBody.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
-        }
-        if (part.parts) {
-          for (const p of part.parts) {
-            extractBody(p);
-          }
+  return result.messages.map((msg: any) => {
+    const headers = msg.payload?.headers || [];
+    const getHeader = (name: string): string => {
+      const h = headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase());
+      return h?.value || "";
+    };
+
+    // Extract body from MIME parts, preferring plain text over HTML
+    let body = "";
+    function extractBody(part: any): void {
+      if (part.mimeType === "text/plain" && part.body?.data) {
+        body = Buffer.from(part.body.data, "base64url").toString("utf-8");
+      } else if (part.mimeType === "text/html" && part.body?.data && !body) {
+        const htmlBody = Buffer.from(part.body.data, "base64url").toString("utf-8");
+        body = htmlBody.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+      }
+      if (part.parts) {
+        for (const p of part.parts) {
+          extractBody(p);
         }
       }
-      extractBody(msg.payload);
+    }
+    extractBody(msg.payload);
 
-      // Note: The AI API only accepts message_id, subject, and body fields
-      // Additional fields like from, to, date cause a 400 error
-      return {
-        message_id: msg.id,
-        subject: getHeader("Subject"),
-        body: body || msg.snippet || "",
-      };
-    });
-  }
+    return {
+      message_id: msg.id,
+      subject: getHeader("Subject"),
+      body: body || msg.snippet || "",
+      from: parseEmailAddress(getHeader("From")),
+      to: parseRecipientList(getHeader("To")),
+      cc: parseRecipientList(getHeader("Cc")),
+      date: getHeader("Date"),
+      snippet: msg.snippet || "",
+    };
+  });
 }
 
 /**
  * Query Superhuman's AI assistant about an email thread.
  *
- * Uses the /v3/ai.askAIProxy endpoint to ask questions about emails.
+ * Uses the /v3/ai.compose endpoint (Superhuman's native AI compose API).
  * The AI can summarize threads, extract action items, draft replies, etc.
  *
  * @param superhumanToken - Superhuman backend token
@@ -2997,44 +3283,65 @@ export async function getThreadMessagesForAI(
 export async function askAI(
   superhumanToken: string,
   oauthToken: TokenInfo,
-  threadId: string,
+  threadId: string | undefined,
   query: string,
   options?: AIQueryOptions
 ): Promise<AIQueryResult> {
-  // Generate or use existing session ID
   const sessionId = options?.sessionId || crypto.randomUUID();
 
-  // Generate event ID with user prefix if available
-  // The user prefix is required for valid event IDs in Superhuman's format
-  const questionEventId = generateEventId(options?.userPrefix);
+  let payload: Record<string, unknown>;
 
-  // Fetch thread messages for context
-  const threadMessages = await getThreadMessagesForAI(oauthToken, threadId);
+  if (threadId) {
+    // Reply mode: fetch thread messages for context
+    const fullMessages = await getThreadMessages(oauthToken, threadId);
+    const threadMessages = fullMessages.map((m) => ({
+      message_id: m.message_id,
+      subject: m.subject,
+      body: m.body,
+    }));
 
-  if (threadMessages.length === 0) {
-    throw new Error(`Thread not found or has no messages: ${threadId}`);
+    if (threadMessages.length === 0) {
+      throw new Error(`Thread not found or has no messages: ${threadId}`);
+    }
+
+    // Build thread_content string from messages (what Superhuman passes to its backend)
+    const threadContent = threadMessages.map(m =>
+      `Subject: ${m.subject}\n\n${m.body}`
+    ).join("\n\n---\n\n");
+
+    const lastMessage = threadMessages[threadMessages.length - 1];
+
+    payload = {
+      instructions: query,
+      draft_content: "",
+      draft_content_type: "text/html",
+      draft_action: "reply",
+      thread_content: threadContent,
+      subject: threadMessages[0]?.subject || "",
+      to: [],
+      cc: [],
+      bcc: [],
+      thread_id: threadId,
+      last_message_id: lastMessage.message_id,
+    };
+  } else {
+    // Compose mode: no thread context needed
+    payload = {
+      instructions: query,
+      draft_content: "",
+      draft_content_type: "text/html",
+      draft_action: "compose",
+      thread_content: "",
+      subject: "",
+      to: [],
+      cc: [],
+      bcc: [],
+      thread_id: "",
+      last_message_id: "",
+    };
   }
 
-  // Build request payload
-  const payload = {
-    session_id: sessionId,
-    question_event_id: questionEventId,
-    query,
-    chat_history: options?.chatHistory || [],
-    user: {
-      email: options?.userEmail || oauthToken.email,
-      name: options?.userName || "",
-      company: options?.userCompany || "",
-      position: options?.userPosition || "",
-    },
-    local_datetime: new Date().toISOString(),
-    current_thread_id: threadId,
-    current_thread_messages: threadMessages,
-  };
-
-  // The AI endpoint returns a streaming response (Server-Sent Events),
-  // so we use fetch directly instead of superhumanFetch which expects JSON
-  const url = `${SUPERHUMAN_BACKEND_BASE}/v3/ai.askAIProxy`;
+  const url = `${SUPERHUMAN_BACKEND_BASE}/v3/ai.compose`;
 
   const fetchResponse = await fetch(url, {
     method: "POST",
@@ -3055,25 +3362,24 @@ export async function askAI(
   }
 
   // Parse the streaming response (Server-Sent Events format)
+  // ai.compose returns chunks like: data: {"choices":[{"delta":{"content":"text"}}]}
   const responseText = await fetchResponse.text();
   let fullContent = "";
 
-  // Parse SSE data lines to extract the full response
-  const lines = responseText.split("\n");
-  for (const line of lines) {
+  for (const line of responseText.split("\n")) {
     if (line.startsWith("data: ")) {
-      const jsonStr = line.substring(6); // Remove "data: " prefix
-      if (jsonStr === "END") continue;
+      const jsonStr = line.substring(6).trim();
+      if (jsonStr === "[DONE]" || jsonStr === "END" || jsonStr === "") continue;
 
       try {
         const data = JSON.parse(jsonStr);
-        // Extract content from the chunk
-        // The final chunk has the complete content
-        if (data.content) {
-          fullContent = data.content;
+        // ai.compose format: choices[0].delta.content
+        const delta = data?.choices?.[0]?.delta?.content;
+        if (typeof delta === "string") {
+          fullContent += delta;
         }
-        // Also check for finished flag which indicates the response is complete
-        if (data.finished && data.content) {
+        // Also handle legacy askAIProxy format (content at top level)
+        if (data.content && !data.choices) {
           fullContent = data.content;
         }
       } catch {

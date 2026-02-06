@@ -13,7 +13,7 @@ import {
   MarkReadSchema, MarkUnreadSchema, LabelsSchema, GetLabelsSchema, AddLabelSchema, RemoveLabelSchema,
   StarSchema, UnstarSchema, StarredSchema,
   SnoozeSchema, UnsnoozeSchema, SnoozedSchema,
-  AttachmentsSchema, DownloadAttachmentSchema, AddAttachmentSchema,
+  AttachmentsSchema, DownloadAttachmentSchema,
   CalendarListSchema, CalendarCreateSchema, CalendarUpdateSchema, CalendarDeleteSchema, CalendarFreeBusySchema,
   draftHandler, sendHandler, searchHandler, inboxHandler, readHandler,
   accountsHandler, switchAccountHandler, replyHandler, replyAllHandler, forwardHandler,
@@ -21,8 +21,10 @@ import {
   markReadHandler, markUnreadHandler, labelsHandler, getLabelsHandler, addLabelHandler, removeLabelHandler,
   starHandler, unstarHandler, starredHandler,
   snoozeHandler, unsnoozeHandler, snoozedHandler,
-  attachmentsHandler, downloadAttachmentHandler, addAttachmentHandler,
-  calendarListHandler, calendarCreateHandler, calendarUpdateHandler, calendarDeleteHandler, calendarFreeBusyHandler
+  attachmentsHandler, downloadAttachmentHandler,
+  calendarListHandler, calendarCreateHandler, calendarUpdateHandler, calendarDeleteHandler, calendarFreeBusyHandler,
+  SnippetsSchema, UseSnippetSchema,
+  snippetsHandler, useSnippetHandler
 } from "./tools";
 
 function createMcpServer(): McpServer {
@@ -34,7 +36,7 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "superhuman_draft",
     {
-      description: "Create an email draft in Superhuman. Opens the compose window, fills in the fields, and saves as draft.",
+      description: "Create an email draft via Gmail/Outlook API using cached OAuth tokens.",
       inputSchema: DraftSchema,
     },
     draftHandler
@@ -43,7 +45,7 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "superhuman_send",
     {
-      description: "Send an email via Superhuman. Opens the compose window, fills in the fields, and sends the email.",
+      description: "Send an email via Gmail/Outlook API using cached OAuth tokens.",
       inputSchema: SendSchema,
     },
     sendHandler
@@ -266,15 +268,6 @@ function createMcpServer(): McpServer {
   );
 
   server.registerTool(
-    "superhuman_add_attachment",
-    {
-      description: "Add an attachment to the current draft. A compose window must be open first (use superhuman_draft or superhuman_reply). Accepts base64-encoded file data.",
-      inputSchema: AddAttachmentSchema,
-    },
-    addAttachmentHandler
-  );
-
-  server.registerTool(
     "superhuman_calendar_list",
     {
       description: "List calendar events from Superhuman. Returns events for a date range with details including title, time, attendees, and event ID.",
@@ -317,6 +310,24 @@ function createMcpServer(): McpServer {
       inputSchema: CalendarFreeBusySchema,
     },
     calendarFreeBusyHandler
+  );
+
+  server.registerTool(
+    "superhuman_snippets",
+    {
+      description: "List all snippets (reusable email templates) in Superhuman. Returns snippet names, usage stats, and previews.",
+      inputSchema: SnippetsSchema,
+    },
+    snippetsHandler
+  );
+
+  server.registerTool(
+    "superhuman_snippet",
+    {
+      description: "Use a snippet to compose or send an email. Fuzzy-matches snippet by name, applies template variables, and creates a draft or sends immediately.",
+      inputSchema: UseSnippetSchema,
+    },
+    useSnippetHandler
   );
 
   return server;

@@ -21,30 +21,31 @@ bun install
 
 ```bash
 # Check connection status
-bun src/cli.ts status
+superhuman status
 
-# List linked accounts
-bun src/cli.ts accounts
-
-# Switch account
-bun src/cli.ts account 2
-bun src/cli.ts account user@example.com
+# Account management
+superhuman account auth
+superhuman account list
+superhuman account switch 2
+superhuman account switch user@example.com
 ```
 
 ### Reading Email
 
 ```bash
 # List recent inbox emails
-bun src/cli.ts inbox
-bun src/cli.ts inbox --limit 20 --json
+superhuman inbox
+superhuman inbox --limit 20 --json
 
 # Search emails
-bun src/cli.ts search "from:john subject:meeting"
-bun src/cli.ts search "project update" --limit 20
+superhuman search "from:john subject:meeting"
+superhuman search "project update" --limit 20
+superhuman search "from:anthropic" --include-done    # Search all including archived
 
-# Read a specific thread
-bun src/cli.ts read <thread-id>
-bun src/cli.ts read <thread-id> --json
+# Read a specific thread (requires --account)
+superhuman read <thread-id> --account user@gmail.com
+superhuman read <thread-id> --account user@gmail.com --context 3   # Full body for last 3 only
+superhuman read <thread-id> --account user@gmail.com --json
 ```
 
 ### Ask AI
@@ -53,27 +54,27 @@ Query Superhuman's AI about email threads:
 
 ```bash
 # Summarize a thread
-bun src/cli.ts ai <thread-id> "summarize this thread"
+superhuman ai <thread-id> "summarize this thread"
 
 # Get action items
-bun src/cli.ts ai <thread-id> "what are the action items?"
+superhuman ai <thread-id> "what are the action items?"
 
 # Draft a reply
-bun src/cli.ts ai <thread-id> "draft a professional reply"
+superhuman ai <thread-id> "draft a professional reply"
 
 # Ask specific questions
-bun src/cli.ts ai <thread-id> "what dates were mentioned?"
+superhuman ai <thread-id> "what dates were mentioned?"
 ```
 
 ### Contacts
 
 ```bash
 # Search contacts by name
-bun src/cli.ts contacts search "john"
-bun src/cli.ts contacts search "john" --limit 5 --json
+superhuman contact search "john"
+superhuman contact search "john" --limit 5 --json
 
 # Search contacts in a specific account (without switching UI)
-bun src/cli.ts contacts search "john" --account user@gmail.com
+superhuman contact search "john" --account user@gmail.com
 ```
 
 ### Multi-Account Support
@@ -82,13 +83,25 @@ The `--account` flag allows operations on any linked account without switching t
 
 ```bash
 # Search contacts in a specific account
-bun src/cli.ts contacts search "john" --account user@gmail.com
+superhuman contact search "john" --account user@gmail.com
 
 # Works with both Gmail and Microsoft/Outlook accounts
-bun src/cli.ts contacts search "john" --account user@company.com
+superhuman contact search "john" --account user@company.com
 ```
 
-**How it works:** The CLI extracts OAuth tokens directly from Superhuman and makes API calls to Gmail or Microsoft Graph. Tokens are cached in memory with automatic refresh when expired.
+**How it works:** The CLI extracts OAuth tokens directly from Superhuman and makes API calls to Gmail or Microsoft Graph. Tokens are cached to disk with automatic background refresh when expiring.
+
+### Token Management
+
+```bash
+# Extract and cache tokens from Superhuman (required once)
+superhuman account auth
+
+# Tokens are automatically refreshed when expiring
+# If refresh fails, you'll see: "Token for user@email.com expired. Run 'superhuman account auth' to re-authenticate."
+```
+
+Tokens are stored in `~/.config/superhuman-cli/tokens.json` and automatically refreshed using OAuth refresh tokens when they expire (within 5 minutes of expiry). No CDP connection is needed for token refresh.
 
 ### Composing Email
 
@@ -96,35 +109,38 @@ Recipients can be specified as email addresses or contact names. Names are autom
 
 ```bash
 # Create a draft (using email or name)
-bun src/cli.ts draft --to user@example.com --subject "Hello" --body "Hi there!"
-bun src/cli.ts draft --to "john" --subject "Hello" --body "Hi there!"
+superhuman draft create --to user@example.com --subject "Hello" --body "Hi there!"
+superhuman draft create --to "john" --subject "Hello" --body "Hi there!"
 
 # Open compose window (keeps it open for editing)
-bun src/cli.ts compose --to user@example.com --subject "Meeting"
-bun src/cli.ts compose --to "john" --cc "jane" --subject "Meeting"
+superhuman compose --to user@example.com --subject "Meeting"
+superhuman compose --to "john" --cc "jane" --subject "Meeting"
 
 # Send an email
-bun src/cli.ts send --to user@example.com --subject "Quick note" --body "FYI"
+superhuman send --to user@example.com --subject "Quick note" --body "FYI"
 
 # Reply to a thread
-bun src/cli.ts reply <thread-id> --body "Thanks!"
-bun src/cli.ts reply <thread-id> --body "Thanks!" --send
+superhuman reply <thread-id> --body "Thanks!"
+superhuman reply <thread-id> --body "Thanks!" --send
 
 # Reply-all
-bun src/cli.ts reply-all <thread-id> --body "Thanks everyone!"
+superhuman reply-all <thread-id> --body "Thanks everyone!"
 
 # Forward
-bun src/cli.ts forward <thread-id> --to colleague@example.com --body "FYI"
+superhuman forward <thread-id> --to colleague@example.com --body "FYI"
 
 # Update a draft
-bun src/cli.ts draft --update <draft-id> --body "Updated content"
+superhuman draft update <draft-id> --body "Updated content"
 
 # Delete drafts
-bun src/cli.ts delete-draft <draft-id>
-bun src/cli.ts delete-draft <draft-id1> <draft-id2>
+superhuman draft delete <draft-id>
+superhuman draft delete <draft-id1> <draft-id2>
 
 # Send a draft by ID
-bun src/cli.ts send --draft <draft-id>
+superhuman send --draft <draft-id>
+
+# Send a Superhuman draft with content
+superhuman draft send <draft-id> --account=user@example.com --to=recipient@example.com --subject="Subject" --body="Body"
 ```
 
 #### Drafts Limitation
@@ -133,9 +149,9 @@ Drafts are created via **native Gmail/Outlook APIs**, not Superhuman's proprieta
 
 | Where | Visible? |
 |-------|----------|
-| Native Gmail/Outlook web | ✓ Yes |
-| Native mobile apps | ✓ Yes |
-| Superhuman UI | ✗ No |
+| Native Gmail/Outlook web | Yes |
+| Native mobile apps | Yes |
+| Superhuman UI | No |
 
 This is acceptable for CLI workflows where you iterate on drafts with LLMs and send via `--send` flag. If you need to edit in Superhuman UI, open the draft in native Gmail/Outlook first.
 
@@ -143,55 +159,94 @@ This is acceptable for CLI workflows where you iterate on drafts with LLMs and s
 
 ```bash
 # Archive
-bun src/cli.ts archive <thread-id>
-bun src/cli.ts archive <thread-id1> <thread-id2>
+superhuman archive <thread-id>
+superhuman archive <thread-id1> <thread-id2>
 
 # Delete (trash)
-bun src/cli.ts delete <thread-id>
+superhuman delete <thread-id>
 
 # Mark as read/unread
-bun src/cli.ts mark-read <thread-id>
-bun src/cli.ts mark-unread <thread-id>
+superhuman mark read <thread-id>
+superhuman mark unread <thread-id>
 
-# Star/unstar
-bun src/cli.ts star <thread-id>
-bun src/cli.ts unstar <thread-id>
-bun src/cli.ts starred
+# Star / Unstar
+superhuman star add <thread-id>
+superhuman star remove <thread-id>
+superhuman star list
 
-# Snooze/unsnooze
-bun src/cli.ts snooze <thread-id> --until tomorrow
-bun src/cli.ts snooze <thread-id> --until next-week
-bun src/cli.ts snooze <thread-id> --until "2024-02-15T14:00:00Z"
-bun src/cli.ts unsnooze <thread-id>
-bun src/cli.ts snoozed
+# Snooze / Unsnooze
+superhuman snooze set <thread-id> --until tomorrow
+superhuman snooze set <thread-id> --until next-week
+superhuman snooze set <thread-id> --until "2024-02-15T14:00:00Z"
+superhuman snooze cancel <thread-id>
+superhuman snooze list
+```
+
+### Snippets
+
+Reusable email templates stored in Superhuman. Snippets support template variables like `{first_name}`.
+
+```bash
+# List all snippets
+superhuman snippet list
+superhuman snippet list --json
+
+# Use a snippet to create a draft (fuzzy name matching)
+superhuman snippet use "zoom link" --to user@example.com
+
+# Substitute template variables
+superhuman snippet use "share recordings" --to user@example.com --vars "date=Feb 5,student_name=Jane"
+
+# Send immediately using a snippet
+superhuman snippet use "share recordings" --to user@example.com --vars "date=Feb 5" --send
 ```
 
 ### Labels
 
 ```bash
 # List all labels
-bun src/cli.ts labels
+superhuman label list
 
 # Get labels on a thread
-bun src/cli.ts get-labels <thread-id>
+superhuman label get <thread-id>
 
 # Add/remove labels
-bun src/cli.ts add-label <thread-id> --label Label_123
-bun src/cli.ts remove-label <thread-id> --label Label_123
+superhuman label add <thread-id> --label Label_123
+superhuman label remove <thread-id> --label Label_123
 ```
 
 ### Attachments
 
 ```bash
 # List attachments in a thread
-bun src/cli.ts attachments <thread-id>
+superhuman attachment list <thread-id>
 
 # Download all attachments from a thread
-bun src/cli.ts download <thread-id>
-bun src/cli.ts download <thread-id> --output ./downloads
+superhuman attachment download <thread-id>
+superhuman attachment download <thread-id> --output ./downloads
 
 # Download specific attachment
-bun src/cli.ts download --attachment <attachment-id> --message <message-id> --output ./file.pdf
+superhuman attachment download --attachment <attachment-id> --message <message-id> --output ./file.pdf
+```
+
+### Calendar
+
+```bash
+# List events
+superhuman calendar list
+superhuman calendar list --date tomorrow --range 7 --json
+
+# Create event
+superhuman calendar create --title "Meeting" --start "2pm" --duration 30
+superhuman calendar create --title "All Day" --date 2026-02-05
+
+# Update/delete event
+superhuman calendar update --event <event-id> --title "New Title"
+superhuman calendar delete --event <event-id>
+
+# Check availability
+superhuman calendar free
+superhuman calendar free --date tomorrow --range 7
 ```
 
 ### Options
@@ -205,15 +260,25 @@ bun src/cli.ts download --attachment <attachment-id> --message <message-id> --ou
 | `--subject <text>` | Email subject |
 | `--body <text>` | Email body (plain text, converted to HTML) |
 | `--html <text>` | Email body as raw HTML |
-| `--send` | Send immediately instead of saving draft (for reply/reply-all/forward) |
-| `--update <id>` | Draft ID to update (for draft command) |
+| `--send` | Send immediately instead of saving draft (for reply/reply-all/forward/snippet) |
+| `--vars <pairs>` | Template variable substitution: `"key1=val1,key2=val2"` (for snippet use) |
 | `--draft <id>` | Draft ID to send (for send command) |
-| `--label <id>` | Label ID (for add-label/remove-label) |
+| `--label <id>` | Label ID (for label add/remove) |
 | `--until <time>` | Snooze until time: preset or ISO datetime |
 | `--output <path>` | Output path for downloads |
 | `--attachment <id>` | Specific attachment ID |
 | `--message <id>` | Message ID (required with --attachment) |
 | `--limit <number>` | Number of results (default: 10) |
+| `--include-done` | Search all emails including archived (for search) |
+| `--context <number>` | Number of messages to show full body (default: all, for read) |
+| `--date <date>` | Date for calendar (YYYY-MM-DD or "today", "tomorrow") |
+| `--range <days>` | Days to show for calendar (default: 1) |
+| `--start <time>` | Event start time (ISO datetime or natural: "2pm", "tomorrow 3pm") |
+| `--end <time>` | Event end time (ISO datetime) |
+| `--duration <mins>` | Event duration in minutes (default: 30) |
+| `--title <text>` | Event title (for calendar create/update) |
+| `--event <id>` | Event ID (for calendar update/delete) |
+| `--calendar <name>` | Calendar name or ID (default: primary) |
 | `--json` | Output as JSON |
 | `--port <number>` | CDP port (default: 9333) |
 
@@ -232,7 +297,6 @@ bun src/index.ts --mcp
 | `superhuman_inbox` | List recent emails from inbox |
 | `superhuman_search` | Search emails |
 | `superhuman_read` | Read a thread |
-| `superhuman_ai` | Ask AI about a thread |
 | `superhuman_draft` | Create an email draft |
 | `superhuman_send` | Send an email |
 | `superhuman_reply` | Reply to a thread |
@@ -254,9 +318,15 @@ bun src/index.ts --mcp
 | `superhuman_snoozed` | List snoozed threads |
 | `superhuman_attachments` | List attachments in a thread |
 | `superhuman_download_attachment` | Download an attachment |
-| `superhuman_add_attachment` | Add attachment to current draft |
+| `superhuman_snippets` | List all snippets |
+| `superhuman_snippet` | Use a snippet to compose or send |
 | `superhuman_accounts` | List linked accounts |
 | `superhuman_switch_account` | Switch to a different account |
+| `superhuman_calendar_list` | List calendar events |
+| `superhuman_calendar_create` | Create calendar event |
+| `superhuman_calendar_update` | Update calendar event |
+| `superhuman_calendar_delete` | Delete calendar event |
+| `superhuman_calendar_free_busy` | Check free/busy availability |
 
 ### Claude Desktop Configuration
 
@@ -275,11 +345,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ## How It Works
 
-This tool uses a hybrid approach for maximum reliability:
-
 ### Direct API (Primary)
 
-Most operations use **direct Gmail API and Microsoft Graph API** calls:
+Most operations use **direct Gmail API and Microsoft Graph API** calls with cached OAuth tokens:
 
 | Operation | Gmail API | MS Graph API |
 |-----------|-----------|--------------|
@@ -293,22 +361,27 @@ Most operations use **direct Gmail API and Microsoft Graph API** calls:
 | Contacts | Google People API | MS Graph People API |
 | Calendar events | Google Calendar API | MS Graph Calendar API |
 | Free/busy | `POST /freeBusy` | `POST /me/calendar/getSchedule` |
+| Snippets | Superhuman backend API | Superhuman backend API |
 
-OAuth tokens are extracted from Superhuman and cached with automatic refresh.
+OAuth tokens (including refresh tokens) are extracted from Superhuman and cached to disk. When tokens expire, they are automatically refreshed via OAuth endpoints without requiring CDP connection.
 
 ### CDP (Secondary)
 
-Chrome DevTools Protocol is used only for operations that require Superhuman's UI state:
+Chrome DevTools Protocol is only needed for:
 
-- `window.ViewState._composeFormController` - Compose form and draft management (when using UI compose)
-- `window.GoogleAccount` - Token extraction and account switching
+- `account auth` — One-time token extraction from `window.GoogleAccount`
+- `status` — Check Superhuman connection
+- `compose` — Open Superhuman's compose UI
+- `search` / `inbox` (when no cached tokens) — Fallback via Superhuman's portal API
+
+All other operations (read, reply, forward, draft, archive, delete, labels, star, snooze, attachments, calendar, contacts, snippets) use direct API with cached tokens.
 
 ### Benefits
 
 - **Reliability**: Direct API calls don't depend on Superhuman's UI state
 - **Speed**: No CDP round-trips for most operations
-- **Testability**: API calls can be unit tested without running Superhuman
-- **Multi-account**: Token extraction enables operating on any linked account
+- **Offline from CDP**: After initial `account auth`, most operations work without CDP
+- **Multi-account**: Cached tokens enable operating on any linked account
 
 Supports both Gmail and Microsoft/Outlook accounts.
 
